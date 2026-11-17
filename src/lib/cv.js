@@ -64,26 +64,32 @@ function looksLikeSheet(q) {
   return true;
 }
 
-// Share of a quad's outline that lies on a real edge in the image (ignores stretches along the frame border).
+// How much of a quad's outline lies on a real edge in the image, overall and for each of its four sides.
 function edgeSupport(quad, support, w, h) {
   const data = support.data;
+  const sides = [];
   let hit = 0, total = 0;
   for (let i = 0; i < 4; i++) {
     const a = quad[i], b = quad[(i + 1) % 4];
     const n = Math.max(2, Math.round(Math.hypot(b.x - a.x, b.y - a.y) / 3));
+    let sh = 0, st = 0;
     for (let j = 0; j <= n; j++) {
       const x = Math.round(a.x + ((b.x - a.x) * j) / n), y = Math.round(a.y + ((b.y - a.y) * j) / n);
-      if (x <= 2 || y <= 2 || x >= w - 3 || y >= h - 3) continue;
-      total++;
-      if (data[y * w + x]) hit++;
+      if (x <= 2 || y <= 2 || x >= w - 3 || y >= h - 3) continue; // stretches along the frame border do not count
+      st++;
+      if (data[y * w + x]) sh++;
     }
+    sides.push(st < 8 ? 1 : sh / st);
+    hit += sh; total += st;
   }
-  return total < 20 ? 0.5 : hit / total;
+  return { all: total < 20 ? 0.5 : hit / total, sides };
 }
 
 // Turn the blobs/edges in a binary image into four-corner candidates.
+// Strict mode needs four straight, well-supported sides. Relaxed mode (still photos only) tolerates a hidden corner.
 function collect(cv, bin, w, h, retrieval, out, support, relaxed = false) {
-  const fillMin = relaxed ? 0.65 : 0.8, fillMax = relaxed ? 1.4 : 1.2, supMin = relaxed ? 0.2 : 0.3;
+  const fillMin = relaxed ? 0.65 : 0.85, fillMax = relaxed ? 1.4 : 1.15, rectMin = relaxed ? 0.75 : 0.88;
+  const ladder = relaxed ? [0.01, 0.02, 0.03, 0.045, 0.065, 0.09] : [0.01, 0.02, 0.03, 0.045];
   const contours = new cv.MatVector();
   const hier = new cv.Mat();
   try {
@@ -99,7 +105,7 @@ function collect(cv, bin, w, h, retrieval, out, support, relaxed = false) {
           const hullArea = cv.contourArea(hull);
           const peri = cv.arcLength(hull, true);
           let quad = null;
-          for (const eps of [0.01, 0.02, 0.03, 0.045, 0.065, 0.09]) {
+          for (const eps of ladder) {
             const ap = new cv.Mat();
             cv.approxPolyDP(hull, ap, eps * peri, true);
             const rows = ap.rows;
@@ -109,7 +115,7 @@ function collect(cv, bin, w, h, retrieval, out, support, relaxed = false) {
           }
           if (!quad) { // rounded corners or a ragged edge: fall back to the tightest rotated rectangle
             const r = cv.minAreaRect(hull);
-            if (hullArea / (r.size.width * r.size.height) > (relaxed ? 0.7 : 0.82)) quad = cv.RotatedRect.points(r).map((p) => ({ x: p.x, y: p.y }));
+            if (hullArea / (r.size.width * r.size.height) > rectMin) quad = cv.RotatedRect.points(r).map((p) => ({ x: p.x, y: p.y }));
           }
           if (!quad) continue;
           quad = orderCorners(quad.map((p) => ({ x: Math.min(w, Math.max(0, p.x)), y: Math.min(h, Math.max(0, p.y)) })));
@@ -117,7 +123,10 @@ function collect(cv, bin, w, h, retrieval, out, support, relaxed = false) {
           const fill = hullArea / qa;
           if (qa > frame * 0.1 && qa < frame * 0.97 && fill > fillMin && fill < fillMax && looksLikeSheet(quad)) {
             const sup = edgeSupport(quad, support, w, h);
-            if (sup >= supMin) out.push({ quad, score: Math.sqrt(qa / frame) * Math.min(fill, 1 / fill) * sup * sup });
+            const ok = relaxed
+              ? sup.all >= 0.4 && sup.sides.filter((v) => v >= 0.45).length >= 3
+              : sup.all >= 0.6 && Math.min(...sup.sides) >= 0.35;
+            if (ok) out.push({ quad, relaxed, score: Math.sqrt(qa / frame) * Math.min(fill, 1 / fill) * sup.all * sup.all });
           }
         } finally { hull.delete(); }
       } finally { cnt.delete(); }
@@ -125,8 +134,9 @@ function collect(cv, bin, w, h, retrieval, out, support, relaxed = false) {
   } finally { contours.delete(); hier.delete(); }
 }
 
-// How much a candidate looks like a sheet of paper: lighter and less colourful than what surrounds it.
-function sheetPrior(cv, rgb, gray, quad, w, h, kern) {
+// Does a candidate look like a sheet of paper? Returns a ranking factor and a yes/no verdict.
+// Rejects skin-coloured regions (faces, hands, wood), very colourful regions, and shapes with no visible boundary.
+function judgeSheet(cv, rgb, gray, skin, quad, w, h, kern) {
   const mats = [];
   const keep = (m) => (mats.push(m), m);
   try {
@@ -140,25 +150,37 @@ function sheetPrior(cv, rgb, gray, quad, w, h, kern) {
     cv.dilate(mask, outer, kern);
     cv.subtract(outer, mask, ring); // thin band just outside the outline
     cv.subtract(mask, eroded, band); // thin band just inside the outline
-    if (cv.countNonZero(band) < 50 || cv.countNonZero(ring) < 50) return 1;
-    // Compare the two bands rather than the whole interior, so a mat that merely contains a sheet is not mistaken for one.
+    if (cv.countNonZero(band) < 50 || cv.countNonZero(ring) < 50 || cv.countNonZero(eroded) < 50) return { ok: false, bright: 0, sat: 1, prior: 0 };
+
+    // Skin tones inside the shape: a face, a hand or a wooden table is not a document.
+    const skinIn = keep(new cv.Mat());
+    cv.bitwise_and(skin, eroded, skinIn);
+    const skinFrac = cv.countNonZero(skinIn) / cv.countNonZero(eroded);
+
+    // Compare the band just inside with the band just outside, so a mat that merely contains a sheet is not mistaken for one.
     const gi = cv.mean(gray, band)[0], go = cv.mean(gray, ring)[0];
-    const c = cv.mean(rgb, band);
-    const mx = Math.max(c[0], c[1], c[2]), mn = Math.min(c[0], c[1], c[2]);
+    const ci = cv.mean(rgb, band), co = cv.mean(rgb, ring);
+    const colourDist = Math.hypot(ci[0] - co[0], ci[1] - co[1], ci[2] - co[2]);
+    const mx = Math.max(ci[0], ci[1], ci[2]), mn = Math.min(ci[0], ci[1], ci[2]);
     const sat = mx > 0 ? (mx - mn) / mx : 0;
+
+    const boundaryVisible = Math.abs(gi - go) >= 10 || colourDist >= 25;
+    const ok = skinFrac <= 0.4 && sat <= 0.7 && boundaryVisible;
+
     const diff = Math.max(-1, Math.min(1, (gi - go) / 40));
     const contrast = Math.max(0, Math.min(1, (gi - go) / 30)); // only a brighter inside counts
     const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
     const sa = (d(quad[0], quad[1]) + d(quad[3], quad[2])) / 2, sb = (d(quad[1], quad[2]) + d(quad[0], quad[3])) / 2;
     const ratio = Math.max(sa, sb) / Math.min(sa, sb);
     const paperLike = [1.414, 1.294, 1.0, 1.5, 1.586].some((t) => Math.abs(ratio - t) < 0.07 * t) ? 1.06 : 1;
-    return (1 + 0.5 * diff + 0.15 * (1 - Math.min(1, sat / 0.5)) + 0.1 * contrast) * paperLike;
+    return { ok, bright: gi - go, sat, prior: (1 + 0.5 * diff + 0.15 * (1 - Math.min(1, sat / 0.5)) + 0.1 * contrast) * paperLike };
   } finally {
     mats.forEach((m) => { try { m.delete(); } catch { /* already freed */ } });
   }
 }
 
-// Finds the most document-like four-corner shape in an RGBA canvas. `thorough` adds extra strategies.
+// Finds the most document-like four-corner shape in an RGBA canvas, or null if nothing convincing is there.
+// `thorough` adds extra strategies and tolerates a partly hidden page; the live preview stays strict and fast.
 function findDocument(cv, canvas, thorough) {
   const w = canvas.width, h = canvas.height;
   const mats = [];
@@ -223,21 +245,37 @@ function findDocument(cv, canvas, thorough) {
     }
 
     for (const [m, r] of jobs) collect(cv, m, w, h, r, cands, support);
-    if (!cands.length) for (const [m, r] of jobs) collect(cv, m, w, h, r, cands, support, true); // partly hidden or shadowed page
-
+    if (!cands.length && thorough) for (const [m, r] of jobs) collect(cv, m, w, h, r, cands, support, true); // partly hidden page
     if (!cands.length) return null;
     cands.sort((a, b) => b.score - a.score);
-    // Keep the strongest few distinct shapes, then prefer the one that looks most like paper.
+
+    // Skin-tone map (hue and saturation) used to rule out faces, hands and wood.
+    const hsv = keep(new cv.Mat());
+    cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+    const lo = keep(new cv.Mat(h, w, cv.CV_8UC3, new cv.Scalar(0, 45, 60)));
+    const hi = keep(new cv.Mat(h, w, cv.CV_8UC3, new cv.Scalar(16, 170, 255)));
+    const skin = keep(new cv.Mat());
+    cv.inRange(hsv, lo, hi, skin);
+
+    // Judge the strongest few distinct shapes; keep only those that really look like a sheet, best first.
     const kern = keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(...Array(2).fill(Math.max(5, Math.round(Math.min(w, h) * 0.03) | 1)))));
-    const top = [];
+    const seen = [];
+    const judged = [];
     for (const c of cands) {
-      if (top.length >= 6) break;
-      const dup = top.some((t) => t.quad.reduce((sum, p, i) => sum + Math.hypot(p.x - c.quad[i].x, p.y - c.quad[i].y), 0) / 4 < Math.min(w, h) * 0.03);
-      if (!dup) top.push(c);
+      if (judged.length >= 6) break;
+      const dup = seen.some((q) => q.reduce((sum, p, i) => sum + Math.hypot(p.x - c.quad[i].x, p.y - c.quad[i].y), 0) / 4 < Math.min(w, h) * 0.03);
+      if (dup) continue;
+      seen.push(c.quad);
+      const v = judgeSheet(cv, rgb, gray, skin, c.quad, w, h, kern);
+      // A page found only by the relaxed pass must be unmistakably paper: bright, plain, and fully inside the frame.
+      const m = Math.min(w, h) * 0.02;
+      const inside = c.quad.every((p) => p.x > m && p.y > m && p.x < w - m && p.y < h - m);
+      if (c.relaxed && !(v.bright >= 20 && v.sat <= 0.3 && inside)) continue;
+      if (v.ok) judged.push({ quad: c.quad, final: c.score * v.prior });
     }
-    for (const c of top) c.final = c.score * sheetPrior(cv, rgb, gray, c.quad, w, h, kern);
-    top.sort((a, b) => b.final - a.final);
-    return top[0].quad.map((p) => ({ x: p.x / w, y: p.y / h }));
+    if (!judged.length) return null; // nothing convincing: better to show nothing than something wrong
+    judged.sort((a, b) => b.final - a.final);
+    return judged[0].quad.map((p) => ({ x: p.x / w, y: p.y / h }));
   } finally {
     mats.forEach((m) => { try { m.delete(); } catch { /* already freed */ } });
   }

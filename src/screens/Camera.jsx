@@ -94,7 +94,7 @@ export default function Camera({ count, mode, cv, onCapture, onDone }) {
         const k = Math.max(W / v.videoWidth, H / v.videoHeight);
         const ox = (W - v.videoWidth * k) / 2, oy = (H - v.videoHeight * k) / 2;
         svg.current.setAttribute('viewBox', `0 0 ${W} ${H}`);
-        if (L.quad) {
+        if (L.quad && L.stable >= 3) { // only draw once the same shape has been seen for a few frames in a row
           const pts = L.quad.map((p) => {
             const x = p.x * v.videoWidth * k + ox;
             return `${(mirrorRef.current ? W - x : x).toFixed(1)},${(p.y * v.videoHeight * k + oy).toFixed(1)}`;
@@ -123,7 +123,7 @@ export default function Camera({ count, mode, cv, onCapture, onDone }) {
     setFlash(true);
     setTimeout(() => setFlash(false), 140);
     const L = live.current;
-    const hint = wantLive && L.quad && L.stable >= 2 ? L.quad : null; // outline seen at the moment of capture
+    const hint = wantLive && L.quad && L.stable >= 3 ? L.quad : null; // outline seen at the moment of capture
     try {
       const c = document.createElement('canvas');
       c.width = v.videoWidth; c.height = v.videoHeight;
