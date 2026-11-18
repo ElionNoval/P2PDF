@@ -50,7 +50,7 @@ export default function App() {
       try {
         const blob = item instanceof Blob ? item : item.blob;
         const n = await normalize(blob);
-        added.push({ id: ++uid, ...n, hint: item.hint || null, corners: null, detected: false, skipCrop: false, ...DEFAULT_EDITS });
+        added.push({ id: ++uid, ...n, hint: item.hint || null, rotate: 0, corners: null, detected: false, skipCrop: false, ...DEFAULT_EDITS });
       } catch {
         bad++;
       }
@@ -80,6 +80,7 @@ export default function App() {
   };
 
   const patchPage = (id, patch) => update((l) => l.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  const applyToAll = (patch) => update((l) => l.map((p) => ({ ...p, ...patch })));
   const removePage = (i) => {
     URL.revokeObjectURL(pagesRef.current[i].url);
     update((l) => l.filter((_, j) => j !== i));
@@ -157,6 +158,7 @@ export default function App() {
           key={pages[editIndex].id}
           page={pages[editIndex]} index={editIndex} total={pages.length} mode={mode} cv={cv}
           onChange={(patch) => patchPage(pages[editIndex].id, patch)}
+          onApplyAll={applyToAll}
           onBack={() => setScreen('pages')}
         />
       )}

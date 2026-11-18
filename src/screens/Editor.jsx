@@ -7,7 +7,7 @@ const FILTERS = [['original', 'Original'], ['auto', 'Auto Enhance'], ['gray', 'G
 const DEFAULT_CORNERS = [{ x: 0.08, y: 0.08 }, { x: 0.92, y: 0.08 }, { x: 0.92, y: 0.92 }, { x: 0.08, y: 0.92 }];
 const clamp = (v) => Math.min(1, Math.max(0, v));
 
-export default function Editor({ page, index, total, mode, cv, onChange, onBack }) {
+export default function Editor({ page, index, total, mode, cv, onChange, onApplyAll, onBack }) {
   const clean = mode === 'clean';
   const [tab, setTab] = useState('crop');
   const [preview, setPreview] = useState('');
@@ -18,7 +18,7 @@ export default function Editor({ page, index, total, mode, cv, onChange, onBack 
 
   // Live preview of the result (crop + filter) on a small copy.
   useEffect(() => {
-    if (!clean || tab !== 'enhance') return;
+    if (clean && tab !== 'enhance') return;
     let dead = false;
     setBusy(true);
     const t = setTimeout(async () => {
@@ -30,7 +30,7 @@ export default function Editor({ page, index, total, mode, cv, onChange, onBack 
       if (!dead) setBusy(false);
     }, 120);
     return () => { dead = true; clearTimeout(t); };
-  }, [tab, clean, page.corners, page.skipCrop, page.filter, page.brightness, page.contrast]);
+  }, [tab, clean, page.corners, page.skipCrop, page.filter, page.brightness, page.contrast, page.rotate]);
 
   const detect = async () => {
     if (cv !== 'ready') { setMsg('The detector is not available. Drag the corners by hand.'); if (!page.corners) onChange({ corners: DEFAULT_CORNERS, skipCrop: false }); return; }
@@ -63,8 +63,9 @@ export default function Editor({ page, index, total, mode, cv, onChange, onBack 
 
       {!clean ? (
         <>
-          <div className="stage"><img src={page.url} alt={`Page ${index + 1}`} /></div>
+          <div className="stage">{preview ? <img src={preview} alt={`Page ${index + 1}`} className={busy ? 'dim' : ''} /> : <img src={page.url} alt={`Page ${index + 1}`} />}</div>
           <p className="note">Original photo mode exports this page as it is. Switch to Clean document to crop and enhance.</p>
+          <button className="btn secondary" onClick={() => onChange({ rotate: ((page.rotate || 0) + 90) % 360 })}>Rotate 90 degrees</button>
         </>
       ) : (
         <>
@@ -114,7 +115,15 @@ export default function Editor({ page, index, total, mode, cv, onChange, onBack 
               <label className="slider">Contrast
                 <input type="range" min="-50" max="100" value={page.contrast} onChange={(e) => onChange({ contrast: +e.target.value })} />
               </label>
-              <button className="btn secondary" onClick={() => onChange(DEFAULT_EDITS)}>Reset</button>
+              <div className="row">
+                <button className="btn secondary" onClick={() => onChange({ rotate: ((page.rotate || 0) + 90) % 360 })}>Rotate 90 degrees</button>
+                <button className="btn secondary" onClick={() => onChange({ ...DEFAULT_EDITS, rotate: 0 })}>Reset</button>
+              </div>
+              {total > 1 && (
+                <button className="btn quiet" onClick={() => { onApplyAll({ filter: page.filter, brightness: page.brightness, contrast: page.contrast }); setMsg('Filter and adjustments applied to all pages.'); }}>
+                  Apply to all pages
+                </button>
+              )}
             </>
           )}
         </>

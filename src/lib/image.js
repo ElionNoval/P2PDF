@@ -1,13 +1,13 @@
 export const MAX_PAGES = 10;
 export const LIMIT_MSG = 'Only 10 pages are allowed per PDF.';
-const WORK_MAX = 2400; // longest edge kept for each page, keeps memory use sane on phones
+const WORK_MAX = 3200; // longest edge kept for each page, keeps memory use sane on phones
 
 export const tick = () => new Promise((r) => setTimeout(r, 0));
 
 export const isImageFile = (f) =>
   ['image/jpeg', 'image/png', 'image/webp'].includes(f.type) || /\.(jpe?g|png|webp)$/i.test(f.name || '');
 
-export const canvasToBlob = (canvas, q = 0.92) =>
+export const canvasToBlob = (canvas, q = 0.93) =>
   new Promise((res, rej) =>
     canvas.toBlob((b) => (b ? res(b) : rej(new Error('Could not encode image'))), 'image/jpeg', q)
   );
@@ -35,7 +35,7 @@ export async function normalize(source) {
     ctx.fillStyle = '#fff';
     ctx.fillRect(0, 0, w, h);
     ctx.drawImage(img, 0, 0, w, h);
-    const blob = await canvasToBlob(c, 0.92);
+    const blob = await canvasToBlob(c, 0.93);
     c.width = c.height = 0;
     return { url: URL.createObjectURL(blob), w, h };
   } finally {

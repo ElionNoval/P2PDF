@@ -3,6 +3,36 @@ import { warp } from './cv.js';
 
 export const DEFAULT_EDITS = { filter: 'auto', brightness: 0, contrast: 0 };
 
+// Light sharpening restores the crispness lost when a photo is straightened and resampled.
+function sharpenInPlace(d, W, H, k) {
+  const src = new Uint8ClampedArray(d);
+  const row = W * 4;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * row + x * 4;
+      for (let c = 0; c < 3; c++) {
+        const j = i + c;
+        d[j] = src[j] * (1 + 4 * k) - k * (src[j - 4] + src[j + 4] + src[j - row] + src[j + row]);
+      }
+    }
+  }
+}
+
+function rotateCanvas(canvas, deg) {
+  const turn = ((deg % 360) + 360) % 360;
+  if (!turn) return canvas;
+  const out = document.createElement('canvas');
+  const swap = turn === 90 || turn === 270;
+  out.width = swap ? canvas.height : canvas.width;
+  out.height = swap ? canvas.width : canvas.height;
+  const ctx = out.getContext('2d');
+  ctx.translate(out.width / 2, out.height / 2);
+  ctx.rotate((turn * Math.PI) / 180);
+  ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+  canvas.width = canvas.height = 0;
+  return out;
+}
+
 // Non-destructive: the source image is never modified, edits are applied to a fresh canvas each time.
 export function applyAdjust(canvas, { filter, brightness, contrast }) {
   const W = canvas.width, H = canvas.height;
@@ -31,7 +61,7 @@ export function applyAdjust(canvas, { filter, brightness, contrast }) {
     const g = new Uint8Array(W * H);
     for (let p = 0, i = 0; p < g.length; p++, i += 4) g[p] = luma(i);
     const S = W + 1;
-    const I = new Float64Array(S * (H + 1));
+    const I = new Uint32Array(S * (H + 1)); // sums stay below 2^32 for any page up to ~16 megapixels
     for (let y = 0; y < H; y++) {
       let row = 0;
       for (let x = 0; x < W; x++) {
@@ -53,6 +83,8 @@ export function applyAdjust(canvas, { filter, brightness, contrast }) {
     }
   }
 
+  if (filter === 'auto' || filter === 'gray') sharpenInPlace(d, W, H, 0.35);
+
   if (brightness || contrast) {
     const c = 1 + contrast / 100, b = brightness * 1.28;
     const lut = new Uint8ClampedArray(256);
@@ -62,13 +94,19 @@ export function applyAdjust(canvas, { filter, brightness, contrast }) {
   ctx.putImageData(img, 0, 0);
 }
 
+// Trim a hair off the inside of the crop so the paper's own edge and shadow never show as a dark fringe.
+function insetQuad(q, f = 0.016) {
+  const cx = q.reduce((a, p) => a + p.x, 0) / 4, cy = q.reduce((a, p) => a + p.y, 0) / 4;
+  return q.map((p) => ({ x: cx + (p.x - cx) * (1 - f), y: cy + (p.y - cy) * (1 - f) }));
+}
+
 // mode 'original': untouched pixels. mode 'clean': crop + perspective + enhancement.
 export async function renderPage(page, mode, maxDim) {
   const img = await loadImg(page.url);
   const iw = img.naturalWidth, ih = img.naturalHeight;
   let canvas;
   if (mode === 'clean' && page.corners && !page.skipCrop) {
-    canvas = warp(img, page.corners, maxDim);
+    canvas = warp(img, insetQuad(page.corners), maxDim);
   } else {
     const s = Math.min(1, maxDim / Math.max(iw, ih));
     canvas = document.createElement('canvas');
@@ -77,5 +115,5 @@ export async function renderPage(page, mode, maxDim) {
     canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
   }
   if (mode === 'clean') applyAdjust(canvas, page);
-  return canvas;
+  return rotateCanvas(canvas, page.rotate || 0);
 }

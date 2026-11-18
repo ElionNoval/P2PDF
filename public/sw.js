@@ -1,6 +1,6 @@
 // P2PDF service worker: caches the app (including OpenCV) so it opens and scans offline.
 // Bump CACHE when you want every user to drop old cached files.
-const CACHE = 'p2pdf-v1';
+const CACHE = 'p2pdf-v2';
 const CORE = ['./', './index.html', './manifest.webmanifest', './opencv.js', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {

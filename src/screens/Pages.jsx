@@ -6,17 +6,17 @@ import { renderPage } from '../lib/render.js';
 function Thumb({ page, mode }) {
   const [src, setSrc] = useState(page.url);
   useEffect(() => {
-    if (mode !== 'clean') { setSrc(page.url); return; }
+    if (mode !== 'clean' && !page.rotate) { setSrc(page.url); return; }
     let dead = false;
     const t = setTimeout(async () => {
       try {
-        const c = await renderPage(page, 'clean', 320);
+        const c = await renderPage(page, mode, 320);
         if (!dead) setSrc(c.toDataURL('image/jpeg', 0.75));
         c.width = c.height = 0;
       } catch { if (!dead) setSrc(page.url); }
     }, 60);
     return () => { dead = true; clearTimeout(t); };
-  }, [mode, page.url, page.corners, page.skipCrop, page.filter, page.brightness, page.contrast]);
+  }, [mode, page.url, page.corners, page.skipCrop, page.filter, page.brightness, page.contrast, page.rotate]);
   return <img src={src} alt="" />;
 }
 

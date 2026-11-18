@@ -13,7 +13,7 @@ export async function buildPdf(pages, mode, onProgress) {
   for (let i = 0; i < pages.length; i++) {
     onProgress?.(i + 1, pages.length);
     await tick(); // let the UI repaint between heavy pages
-    const c = await renderPage(pages[i], mode, 2000);
+    const c = await renderPage(pages[i], mode, 2800);
     const orient = c.width > c.height ? 'l' : 'p';
     if (!pdf) pdf = new jsPDF({ orientation: orient, unit: 'mm', format: 'a4', compress: true });
     else pdf.addPage('a4', orient);
@@ -21,7 +21,7 @@ export async function buildPdf(pages, mode, onProgress) {
     const pw = pdf.internal.pageSize.getWidth(), ph = pdf.internal.pageSize.getHeight();
     const k = Math.min((pw - 2 * MARGIN) / c.width, (ph - 2 * MARGIN) / c.height);
     const w = c.width * k, h = c.height * k;
-    pdf.addImage(c.toDataURL('image/jpeg', 0.88), 'JPEG', (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
+    pdf.addImage(c.toDataURL('image/jpeg', 0.92), 'JPEG', (pw - w) / 2, (ph - h) / 2, w, h, undefined, 'FAST');
 
     const t = document.createElement('canvas');
     const ts = 220 / Math.max(c.width, c.height);
