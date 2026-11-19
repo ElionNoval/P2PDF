@@ -316,8 +316,8 @@ function judge(cv, S, quad, wantLines) {
   if (coarseStd > T.coarseMax) return fail('uneven ' + coarseStd.toFixed(2));
 
   let nCore = 0, skinCore = 0, nAll = 0, skinAll = 0;
-  scan(core, w, h, (x, y) => { nCore++; if (S.skin[y * w + x]) skinCore++; });
-  scan(whole, w, h, (x, y) => { nAll++; if (S.skin[y * w + x]) skinAll++; });
+  scan(core, w, h, (x, y) => { nCore++; if (S.skinBig[y * w + x]) skinCore++; });
+  scan(whole, w, h, (x, y) => { nAll++; if (S.skinBig[y * w + x]) skinAll++; });
   if (nCore && skinCore / nCore > T.skinCenter) return fail('skin in the middle');
   if (nAll && skinAll / nAll > T.skinTotal) return fail('too much skin');
 
@@ -354,6 +354,56 @@ function judge(cv, S, quad, wantLines) {
   const conf = 0.38 * meanSup + 0.2 * clamp01((uni - 0.4) / 0.5) + 0.15 * clamp01(contrast / 40) + 0.15 * (1 - clamp01(coarseStd / 0.2)) + 0.12 * clamp01(1 - off2 / T.offAxisMax);
   if (conf < T.confMin) return fail('low confidence');
   return { ok: true, why: 'ok', conf };
+}
+
+// Share of a side lying on a straight edge that runs along it (same test as in judge, without the extras).
+function edgeSup(S, a, b) {
+  const { w, h } = S;
+  const len = dist(a, b);
+  if (len < 8) return 0;
+  const u = { x: (b.x - a.x) / len, y: (b.y - a.y) / len }, n = { x: -u.y, y: u.x };
+  const r = Math.max(2, Math.round(Math.min(w, h) * 0.012));
+  const steps = Math.max(10, Math.round(len / 2));
+  let tot = 0, hit = 0;
+  for (let j = 0; j <= steps; j++) {
+    const t = 0.04 + (0.92 * j) / steps;
+    const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
+    tot++;
+    for (let k = -r; k <= r; k++) {
+      const x = Math.round(px + n.x * k), y = Math.round(py + n.y * k);
+      if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) continue;
+      const idx = y * w + x, gx = S.gx[idx], gy = S.gy[idx];
+      const gm = Math.hypot(gx, gy);
+      if (gm >= 24 && Math.abs(gx * n.x + gy * n.y) >= 0.85 * gm) { hit++; break; }
+    }
+  }
+  return hit / tot;
+}
+
+// Nudge each corner toward the strongest straight edges without losing a sheet-like shape.
+function growQuad(S, quad) {
+  const { w, h } = S;
+  const minDim = Math.min(w, h);
+  const q = quad.map((p) => ({ ...p }));
+  const score = (z) => z.reduce((t, p, i) => t + edgeSup(S, p, z[(i + 1) % 4]), 0) + (0.4 * polyArea(z)) / (w * h);
+  let cur = score(q);
+  for (const step of [0.035, 0.018, 0.009]) {
+    for (let it = 0; it < 2; it++) {
+      for (let i = 0; i < 4; i++) {
+        let bp = q[i], bs = cur;
+        for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) {
+          if (!dx && !dy) continue;
+          const p = { x: q[i].x + dx * step * minDim, y: q[i].y + dy * step * minDim };
+          const z = q.slice(); z[i] = p;
+          if (!looksLikeSheet(z, w, h, T.marginStill)) continue;
+          const sc = score(z);
+          if (sc > bs + 0.02) { bs = sc; bp = p; }
+        }
+        if (bp !== q[i]) { q[i] = bp; cur = bs; }
+      }
+    }
+  }
+  return q;
 }
 
 // Per-frame data shared by all candidates (copied out of WASM memory so it stays valid).
@@ -395,9 +445,13 @@ function prepare(cv, canvas, keep) {
   const skinD = keep(new cv.Mat());
   cv.dilate(skinM, skinD, k5);
   const skinDd = skinD.data.slice();
+  const kb = Math.max(5, Math.round(Math.min(w, h) * 0.035) | 1);
+  const skinBigM = keep(new cv.Mat());
+  cv.morphologyEx(skinM, skinBigM, cv.MORPH_OPEN, keep(cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(kb, kb))));
+  const skinBig = skinBigM.data.slice();
   return {
     w, h, rgb, gray: blur3.data.slice(), gx: gxM.data32F.slice(), gy: gyM.data32F.slice(), coarse: coarseM.data.slice(),
-    skin: skinClean, skinD, fineEdges: fine, paperM: mk(paper), satM: mk(sat), blur: blur3, rgbM, grayM, k5,
+    skin: skinClean, skinBig, skinD, fineEdges: fine, paperM: mk(paper), satM: mk(sat), blur: blur3, rgbM, grayM, k5,
     skinNear: (x, y) => { const xi = Math.round(x), yi = Math.round(y); return xi >= 0 && yi >= 0 && xi < w && yi < h && !!skinDd[yi * w + xi]; },
   };
 }
@@ -507,6 +561,12 @@ export function findDocument(cv, canvas, thorough, debug, hint) {
       evaluate(jobs, 8);
     }
 
+    if (best) { // pull short corners out to the real page edge; keep the result only if it is still convincing
+      const g = growQuad(S, best.quad);
+      const v = judge(cv, S, g, true);
+      if (v.ok) best = { quad: g, conf: Math.max(v.conf, best.conf) };
+    }
+
     if (debug) return { quad: best ? toNorm(best.quad) : null, conf: best?.conf, why: verdicts.length ? verdicts : ['no candidates'] };
     return best ? toNorm(best.quad) : null; // nothing convincing: better to show nothing than something wrong
   } finally {
@@ -595,14 +655,17 @@ export function detectCorners(source, { live = false, hint = null } = {}) {
   const sw = source.videoWidth || source.naturalWidth || source.width;
   const sh = source.videoHeight || source.naturalHeight || source.height;
   if (!sw || !sh) return null;
-  const side = live ? 300 : 560;
-  const s = Math.min(1, side / Math.max(sw, sh));
-  const w = Math.round(sw * s), h = Math.round(sh * s);
+  const passes = live ? [[320, false]] : [[320, false], [560, true]];
   const c = live ? (scratch ||= document.createElement('canvas')) : document.createElement('canvas');
-  c.width = w; c.height = h;
-  c.getContext('2d', { willReadFrequently: true }).drawImage(source, 0, 0, w, h);
   try {
-    const q = findDocument(window.cv, c, !live, false, live ? hint : null);
+    let q = null;
+    for (const [side, thorough] of passes) {
+      const s = Math.min(1, side / Math.max(sw, sh));
+      c.width = Math.round(sw * s); c.height = Math.round(sh * s);
+      c.getContext('2d', { willReadFrequently: true }).drawImage(source, 0, 0, c.width, c.height);
+      q = findDocument(window.cv, c, thorough, false, live ? hint : null);
+      if (q) break;
+    }
     if (!q || live) return q;
     return refineCorners(window.cv, source, q) || q;
   } catch (e) {
