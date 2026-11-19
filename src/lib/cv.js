@@ -45,11 +45,9 @@ const T = {
   aspectMax: 2.3,       // longest/shortest side
   sideSupport: 0.6,     // each visible side: share of its length lying on a real, straight, matching edge
   meanSupport: 0.72,    // average over the visible sides
-  minContrast: 7,       // grey-level step across a side (inside brighter than outside)
-  paperMinGrey: 100,    // paper is bright
-  paperMaxSat: 0.27,    // ...and nearly colourless
-  paperUniform: 0.6,    // share of the interior that is one flat paper tone
-  chromaMax: 0.18,      // share of clearly coloured pixels allowed inside (blankets, clothes, tables)
+  minContrast: 7,       // grey-level step across a side
+  paperMinGrey: 70,     // not a dark object (screen off, black cover)
+  paperUniform: 0.5,    // share of the interior that is one flat colour (any colour: white, blue, pink...)
   coarseMax: 0.17,      // blankets, folds and pillows vary a lot more than a sheet of paper does
   skinCenter: 0.015,    // skin in the middle of the page: a hand, a face, a bed with someone on it
   skinTotal: 0.22,      // fingers may only cover the rim
@@ -222,13 +220,13 @@ function collect(cv, bin, S, retrieval, out, margin) {
 
 /* ---------- judging a candidate ---------- */
 // Everything below looks at the candidate the way a person would: are the four sides real, straight, matching edges?
-// Is the inside flat, plain paper rather than a blanket, a table, a face or a hand?
+// Is the inside one flat page rather than a blanket, a table, a face or a hand?
 function judge(cv, S, quad, wantLines) {
   const { w, h } = S;
   const minDim = Math.min(w, h);
   const c = centroid(quad);
   const r = Math.max(2, Math.round(minDim * 0.012)); // search distance across a side
-  const off = Math.max(4, Math.round(minDim * 0.02)); // compare the paper just inside with the surface just outside
+  const off = Math.max(4, Math.round(minDim * 0.02)); // compare the page just inside with the surface just outside
   const fail = (why) => ({ ok: false, why, conf: 0 });
   const sides = [];
 
@@ -286,8 +284,8 @@ function judge(cv, S, quad, wantLines) {
   if (meanSup < T.meanSupport) return fail('low support');
   if (vis.some((s) => Math.abs(s.contrast) < T.minContrast && s.cdist < 18)) return fail('no boundary');
   const lit = vis.filter((s) => Math.abs(s.contrast) >= T.minContrast);
-  if (lit.some((s) => s.contrast < 0)) return fail('inside darker ' + sides.map((s) => s.contrast.toFixed(0)).join('/'));
-  const contrast = vis.reduce((s, v) => s + Math.max(0, v.contrast), 0) / vis.length;
+  if (lit.some((s) => s.contrast > 0) && lit.some((s) => s.contrast < 0)) return fail('mixed edges ' + sides.map((s) => s.contrast.toFixed(0)).join('/'));
+  const contrast = vis.reduce((s, v) => s + Math.abs(v.contrast), 0) / vis.length;
   const sharpness = vis.reduce((s, v) => s + v.sharp, 0) / vis.length;
   if (sharpness < T.sharpMin) return fail('soft outline ' + sharpness.toFixed(2));
   if (contrast < T.minContrast * 0.8 && vis.reduce((s, v) => s + v.cdist, 0) / vis.length < 30) return fail('flat contrast');
@@ -301,20 +299,20 @@ function judge(cv, S, quad, wantLines) {
   let acc = 0, med = 0;
   while (med < 255 && (acc += hist[med]) < nC / 2) med++;
   if (med < T.paperMinGrey) return fail('too dark');
-  const tol = Math.max(20, med * 0.16);
-  let near = 0, sr = 0, sg = 0, sb = 0, cs = 0, cq = 0, chroma = 0;
+  // the page's main colour = average colour of the pixels around the median brightness
+  let rr = 0, gg = 0, bb = 0, nr = 0;
+  scan(centre, w, h, (x, y) => { const i = y * w + x; if (Math.abs(S.gray[i] - med) <= 10) { rr += S.rgb[i * 3]; gg += S.rgb[i * 3 + 1]; bb += S.rgb[i * 3 + 2]; nr++; } });
+  if (!nr) return fail('no tone');
+  rr /= nr; gg /= nr; bb /= nr;
+  const ctol = Math.max(40, med * 0.22);
+  let near = 0, cs = 0, cq = 0;
   scan(centre, w, h, (x, y) => {
-    const i = y * w + x, g = S.gray[i];
-    const cv2 = S.coarse[i];
-    { const R = S.rgb[i * 3], G = S.rgb[i * 3 + 1], B = S.rgb[i * 3 + 2], mxx = Math.max(R, G, B); if (mxx > 40 && (mxx - Math.min(R, G, B)) / mxx > 0.3) chroma++; }
-    if (Math.abs(g - med) <= tol) { near++; cs += cv2; cq += cv2 * cv2; sr += S.rgb[i * 3]; sg += S.rgb[i * 3 + 1]; sb += S.rgb[i * 3 + 2]; }
+    const i = y * w + x;
+    if (Math.hypot(S.rgb[i * 3] - rr, S.rgb[i * 3 + 1] - gg, S.rgb[i * 3 + 2] - bb) <= ctol) { near++; const v = S.coarse[i]; cs += v; cq += v * v; }
   });
   const uni = near / nC;
-  if (uni < T.paperUniform) return fail('not flat paper ' + uni.toFixed(2));
-  if (chroma / nC > T.chromaMax) return fail('coloured areas inside ' + (chroma / nC).toFixed(2));
-  const mx = Math.max(sr, sg, sb) / near, mn = Math.min(sr, sg, sb) / near;
-  if (mx > 0 && (mx - mn) / mx > T.paperMaxSat) return fail('coloured');
-  const mean = cs / near, coarseStd = Math.sqrt(Math.max(0, cq / near - mean * mean)) / Math.max(1, mean); // measured on paper pixels only, so print and ink do not count
+  if (uni < T.paperUniform) return fail('not a flat page ' + uni.toFixed(2));
+  const mean = cs / near, coarseStd = Math.sqrt(Math.max(0, cq / near - mean * mean)) / Math.max(1, mean); // measured on page-coloured pixels only, so print and ink do not count
   if (coarseStd > T.coarseMax) return fail('uneven ' + coarseStd.toFixed(2));
 
   let nCore = 0, skinCore = 0, nAll = 0, skinAll = 0;
@@ -353,7 +351,7 @@ function judge(cv, S, quad, wantLines) {
     if (off2 > T.offAxisMax) return fail('creases / folds');
   }
 
-  const conf = 0.38 * meanSup + 0.2 * clamp01((uni - 0.5) / 0.4) + 0.15 * clamp01(contrast / 40) + 0.15 * (1 - clamp01(coarseStd / 0.2)) + 0.12 * clamp01(1 - off2 / T.offAxisMax);
+  const conf = 0.38 * meanSup + 0.2 * clamp01((uni - 0.4) / 0.5) + 0.15 * clamp01(contrast / 40) + 0.15 * (1 - clamp01(coarseStd / 0.2)) + 0.12 * clamp01(1 - off2 / T.offAxisMax);
   if (conf < T.confMin) return fail('low confidence');
   return { ok: true, why: 'ok', conf };
 }
@@ -379,9 +377,10 @@ function prepare(cv, canvas, keep) {
 
   const rgb = rgbM.data.slice();
   const n = w * h;
-  const skin = new Uint8Array(n), paper = new Uint8Array(n);
+  const skin = new Uint8Array(n), paper = new Uint8Array(n), sat = new Uint8Array(n);
   for (let i = 0, p = 0; i < n; i++, p += 3) {
     const R = rgb[p], G = rgb[p + 1], B = rgb[p + 2];
+    { const mxs = Math.max(R, G, B); sat[i] = mxs ? ((mxs - Math.min(R, G, B)) * 255) / mxs : 0; }
     if (isSkin(R, G, B)) skin[i] = 255;
     else {
       const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
@@ -398,45 +397,87 @@ function prepare(cv, canvas, keep) {
   const skinDd = skinD.data.slice();
   return {
     w, h, rgb, gray: blur3.data.slice(), gx: gxM.data32F.slice(), gy: gyM.data32F.slice(), coarse: coarseM.data.slice(),
-    skin: skinClean, skinD, fineEdges: fine, paperM: mk(paper), blur: blur3, rgbM, grayM, k5,
+    skin: skinClean, skinD, fineEdges: fine, paperM: mk(paper), satM: mk(sat), blur: blur3, rgbM, grayM, k5,
     skinNear: (x, y) => { const xi = Math.round(x), yi = Math.round(y); return xi >= 0 && yi >= 0 && xi < w && yi < h && !!skinDd[yi * w + xi]; },
   };
 }
 
 // Finds the most document-like four-corner shape in an RGBA canvas, or null if nothing convincing is there.
 // `thorough` adds extra strategies for still photos; the live preview stays strict and fast.
-export function findDocument(cv, canvas, thorough, debug) {
+// `hint` is the page found in the previous live frame (normalised): if it is still there it is confirmed without a new search.
+export function findDocument(cv, canvas, thorough, debug, hint) {
   const mats = [];
   const keep = (m) => (mats.push(m), m);
   try {
     const S = prepare(cv, canvas, keep);
     const { w, h } = S;
     const margin = thorough ? T.marginStill : T.marginLive;
-    const cands = [];
+    const toNorm = (q) => q.map((p) => ({ x: p.x / w, y: p.y / h }));
     const k3 = keep(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3)));
-    const jobs = [];
 
-    // 1) the page as a plain, colourless, bright region with skin cut out (so a hand never becomes part of it)
+    // fast path: the page found in the previous frame is still there, so just re-check it
+    if (hint) {
+      const hq = hint.map((p) => ({ x: p.x * w, y: p.y * h }));
+      if (looksLikeSheet(hq, w, h, margin)) {
+        const v = judge(cv, S, hq, true);
+        if (v.ok) return debug ? { quad: toNorm(hq), conf: v.conf, why: ['hint'] } : toNorm(hq);
+      }
+    }
+
+    const seen = [], verdicts = [];
+    let best = null;
+    const evaluate = (jobs, limit) => {
+      const cands = [];
+      for (const [m, r] of jobs) collect(cv, m, S, r, cands, margin);
+      cands.sort((a, b) => b.pre - a.pre);
+      let tried = 0;
+      for (const c of cands) {
+        if (tried >= limit) break;
+        if (seen.some((q) => q.reduce((t, p, i) => t + dist(p, c.quad[i]), 0) / 4 < Math.min(w, h) * 0.03)) continue;
+        seen.push(c.quad);
+        tried++;
+        let v = judge(cv, S, c.quad, true), q = c.quad;
+        // an outline that swallowed the page's shadow or a loose margin: try it pulled in a little
+        if (!v.ok && /weak|mixed|boundary|support|contrast|soft/.test(v.why)) {
+          for (const f of [0.985, 0.97]) {
+            const q2 = shrink(c.quad, f), v2 = judge(cv, S, q2, true);
+            if (v2.ok) { v = v2; q = q2; break; }
+          }
+        }
+        verdicts.push(v.why);
+        if (v.ok && (!best || v.conf > best.conf)) best = { quad: q, conf: v.conf };
+        if (best && best.conf > 0.85) break; // clearly a page: stop looking
+      }
+    };
+
+    // stage 1 (cheap): a flat region against its surroundings, in brightness or in colour, skin cut out; plus plain edges
     const pm = keep(new cv.Mat());
     cv.subtract(S.paperM, S.skinD, pm);
     cv.morphologyEx(pm, pm, cv.MORPH_OPEN, S.k5);
     cv.morphologyEx(pm, pm, cv.MORPH_CLOSE, S.k5);
-    jobs.push([pm, cv.RETR_EXTERNAL]);
-    // 2) edges on brightness
-    for (const [lo, hi] of thorough ? [[25, 80], [50, 140]] : [[40, 120]]) {
-      const e = keep(new cv.Mat());
-      cv.Canny(S.blur, e, lo, hi);
-      cv.dilate(e, e, k3);
-      jobs.push([e, cv.RETR_LIST]);
-    }
-    // 3) bright (or dark) region against its surroundings, skin removed
     const bin = keep(new cv.Mat());
     cv.threshold(S.blur, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
     cv.subtract(bin, S.skinD, bin);
     cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, S.k5);
     cv.morphologyEx(bin, bin, cv.MORPH_OPEN, S.k5);
-    jobs.push([bin, cv.RETR_EXTERNAL]);
-    if (thorough) {
+    const sb = keep(new cv.Mat()), sbi = keep(new cv.Mat());
+    cv.threshold(S.satM, sb, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU); // coloured page on a plain table
+    cv.bitwise_not(sb, sbi);                                              // plain page on a coloured table
+    for (const m of [sb, sbi]) { cv.subtract(m, S.skinD, m); cv.morphologyEx(m, m, cv.MORPH_CLOSE, S.k5); cv.morphologyEx(m, m, cv.MORPH_OPEN, S.k5); }
+    const e1 = keep(new cv.Mat());
+    cv.Canny(S.blur, e1, 40, 120);
+    cv.dilate(e1, e1, k3);
+    evaluate([[bin, cv.RETR_EXTERNAL], [pm, cv.RETR_EXTERNAL], [e1, cv.RETR_LIST], [sb, cv.RETR_EXTERNAL], [sbi, cv.RETR_EXTERNAL]], thorough ? 6 : 4);
+
+    // stage 2 (photos only, and only when stage 1 found nothing): the slower strategies
+    if (!best && thorough) {
+      const jobs = [];
+      for (const [lo, hi] of [[25, 80], [50, 140]]) {
+        const e = keep(new cv.Mat());
+        cv.Canny(S.blur, e, lo, hi);
+        cv.dilate(e, e, k3);
+        jobs.push([e, cv.RETR_LIST]);
+      }
       const inv = keep(new cv.Mat());
       cv.bitwise_not(bin, inv);
       cv.subtract(inv, S.skinD, inv);
@@ -454,44 +495,20 @@ export function findDocument(cv, canvas, thorough, debug) {
       cv.split(S.rgbM, planes);
       const merged = keep(new cv.Mat());
       for (let i = 0; i < 3; i++) {
-        const p = planes.get(i);
+        const pl = planes.get(i);
         const b = new cv.Mat(), e = new cv.Mat();
-        cv.GaussianBlur(p, b, new cv.Size(5, 5), 0);
+        cv.GaussianBlur(pl, b, new cv.Size(5, 5), 0);
         cv.Canny(b, e, 30, 90);
         if (i === 0) e.copyTo(merged); else cv.bitwise_or(merged, e, merged);
-        p.delete(); b.delete(); e.delete();
+        pl.delete(); b.delete(); e.delete();
       }
       cv.dilate(merged, merged, k3);
       jobs.push([merged, cv.RETR_LIST]);
+      evaluate(jobs, 8);
     }
 
-    for (const [m, r] of jobs) collect(cv, m, S, r, cands, margin);
-    if (!cands.length) return debug ? { quad: null, why: ['no candidates'] } : null;
-    cands.sort((a, b) => b.pre - a.pre);
-
-    // judge the strongest few distinct shapes; the most convincing one wins
-    const seen = [];
-    const verdicts = [];
-    let best = null, tried = 0;
-    for (const c of cands) {
-      if (tried >= 8) break;
-      if (seen.some((q) => q.reduce((s, p, i) => s + dist(p, c.quad[i]), 0) / 4 < Math.min(w, h) * 0.03)) continue;
-      seen.push(c.quad);
-      tried++;
-      let v = judge(cv, S, c.quad, true), q = c.quad;
-      // an outline that swallowed the page's shadow or a loose margin: try it pulled in a little
-      if (!v.ok && /weak|darker|boundary|support|contrast|soft/.test(v.why)) {
-        for (const f of [0.985, 0.97]) {
-          const q2 = shrink(c.quad, f), v2 = judge(cv, S, q2, true);
-          if (v2.ok) { v = v2; q = q2; break; }
-        }
-      }
-      verdicts.push(v.why);
-      if (v.ok && (!best || v.conf > best.conf)) best = { quad: q, conf: v.conf };
-    }
-    if (debug) return { quad: best ? best.quad.map((p) => ({ x: p.x / w, y: p.y / h })) : null, conf: best?.conf, why: verdicts };
-    if (!best) return null; // nothing convincing: better to show nothing than something wrong
-    return best.quad.map((p) => ({ x: p.x / w, y: p.y / h }));
+    if (debug) return { quad: best ? toNorm(best.quad) : null, conf: best?.conf, why: verdicts.length ? verdicts : ['no candidates'] };
+    return best ? toNorm(best.quad) : null; // nothing convincing: better to show nothing than something wrong
   } finally {
     mats.forEach((m) => { try { m.delete(); } catch { /* already freed */ } });
   }
@@ -570,21 +587,22 @@ function refineCorners(cv, source, quad) {
 let scratch = null;
 /**
  * Detect the document in an <img> or <video>. Returns four normalised corners (tl, tr, br, bl) or null.
- * { live: true } uses a smaller image and fewer strategies so it can run several times a second.
+ * { live: true } uses a smaller image and fewer strategies so it can run many times a second.
+ * { hint } (live only) is the previous frame's result, re-checked first for a much faster lock.
  */
-export function detectCorners(source, { live = false } = {}) {
+export function detectCorners(source, { live = false, hint = null } = {}) {
   if (!cvReady()) return null;
   const sw = source.videoWidth || source.naturalWidth || source.width;
   const sh = source.videoHeight || source.naturalHeight || source.height;
   if (!sw || !sh) return null;
-  const side = live ? 360 : 640;
+  const side = live ? 300 : 560;
   const s = Math.min(1, side / Math.max(sw, sh));
   const w = Math.round(sw * s), h = Math.round(sh * s);
   const c = live ? (scratch ||= document.createElement('canvas')) : document.createElement('canvas');
   c.width = w; c.height = h;
   c.getContext('2d', { willReadFrequently: true }).drawImage(source, 0, 0, w, h);
   try {
-    const q = findDocument(window.cv, c, !live);
+    const q = findDocument(window.cv, c, !live, false, live ? hint : null);
     if (!q || live) return q;
     return refineCorners(window.cv, source, q) || q;
   } catch (e) {

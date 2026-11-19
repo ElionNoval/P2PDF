@@ -96,7 +96,7 @@ export default function Camera({ count, mode, cv, onCapture, onDone }) {
       const v = video.current, box = root.current;
       if (v && box && v.videoWidth && cvReady() && !document.hidden) {
         let q = null;
-        try { q = detectCorners(v, { live: true }); } catch { /* skip this frame */ }
+        try { q = detectCorners(v, { live: true, hint: live.current.quad }); } catch { /* skip this frame */ }
         const L = live.current;
         if (q) {
           if (!L.quad) { L.quad = q; L.stable = 1; L.alt = 0; }
