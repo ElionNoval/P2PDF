@@ -36,7 +36,7 @@ export function loadOpenCV() {
 
 /* ---------- tuning (all the strictness knobs live here) ---------- */
 const T = {
-  minArea: 0.12,        // a document must fill at least this share of the frame
+  minArea: 0.08,        // a document must fill at least this share of the frame
   maxArea: 0.9,         // ...and not more than this (a bed or a wall fills the frame, a sheet does not)
   marginLive: 0.012,    // live: every corner must sit this far inside the frame (share of the short side)
   marginStill: 0.004,   // photos: slightly more forgiving
@@ -49,8 +49,8 @@ const T = {
   paperMinGrey: 70,     // not a dark object (screen off, black cover)
   paperUniform: 0.5,    // share of the interior that is one flat colour (any colour: white, blue, pink...)
   coarseMax: 0.17,      // blankets, folds and pillows vary a lot more than a sheet of paper does
-  skinCenter: 0.015,    // skin in the middle of the page: a hand, a face, a bed with someone on it
-  skinTotal: 0.22,      // fingers may only cover the rim
+  skinCenter: 0.1,      // skin-coloured area in the middle of the page that is NOT the page's own colour: a hand, a face
+  skinTotal: 0.3,       // fingers may only cover the rim
   offAxisMax: 1.1,      // long lines that are not parallel to the page sides (folds, creases, pillows)
   sharpMin: 0.35,       // paper edges are crisp, mattress and blanket outlines are soft
   confMin: 0.62,
@@ -279,7 +279,10 @@ function judge(cv, S, quad, wantLines) {
   const vis = sides.filter((s) => s.valid);
   if (vis.length < 3) return fail('sides not visible');
   if (sides.filter((s) => s.hidden).length > 1) return fail('too much hidden');
-  if (vis.some((s) => s.sup < T.sideSupport)) return fail('weak side ' + sides.map((s) => s.valid ? s.sup.toFixed(2) : 'x').join('/'));
+  // every visible side must sit on a real edge; one side may be faint (low contrast against the table) if the others are solid
+  const weakSides = vis.filter((s) => s.sup < T.sideSupport);
+  if (weakSides.length > 1 || weakSides.some((s) => s.sup < 0.3) || (weakSides.length === 1 && vis.some((s) => s !== weakSides[0] && s.sup < 0.7)))
+    return fail('weak side ' + sides.map((s) => s.valid ? s.sup.toFixed(2) : 'x').join('/'));
   const meanSup = vis.reduce((s, v) => s + v.sup, 0) / vis.length;
   if (meanSup < T.meanSupport) return fail('low support');
   if (vis.some((s) => Math.abs(s.contrast) < T.minContrast && s.cdist < 18)) return fail('no boundary');
@@ -304,6 +307,8 @@ function judge(cv, S, quad, wantLines) {
   scan(centre, w, h, (x, y) => { const i = y * w + x; if (Math.abs(S.gray[i] - med) <= 10) { rr += S.rgb[i * 3]; gg += S.rgb[i * 3 + 1]; bb += S.rgb[i * 3 + 2]; nr++; } });
   if (!nr) return fail('no tone');
   rr /= nr; gg /= nr; bb /= nr;
+  const pageSat = (Math.max(rr, gg, bb) - Math.min(rr, gg, bb)) / Math.max(1, Math.max(rr, gg, bb));
+  if (pageSat > 0.25 && isSkin(Math.round(rr), Math.round(gg), Math.round(bb))) return fail('page is skin coloured');
   const ctol = Math.max(40, med * 0.22);
   let near = 0, cs = 0, cq = 0;
   scan(centre, w, h, (x, y) => {
@@ -316,8 +321,9 @@ function judge(cv, S, quad, wantLines) {
   if (coarseStd > T.coarseMax) return fail('uneven ' + coarseStd.toFixed(2));
 
   let nCore = 0, skinCore = 0, nAll = 0, skinAll = 0;
-  scan(core, w, h, (x, y) => { nCore++; if (S.skinBig[y * w + x]) skinCore++; });
-  scan(whole, w, h, (x, y) => { nAll++; if (S.skinBig[y * w + x]) skinAll++; });
+  const offPage = (i) => Math.hypot(S.rgb[i * 3] - rr, S.rgb[i * 3 + 1] - gg, S.rgb[i * 3 + 2] - bb) > ctol; // skin that is not just the page's own tint
+  scan(core, w, h, (x, y) => { nCore++; const i = y * w + x; if (S.skinBig[i] && offPage(i)) skinCore++; });
+  scan(whole, w, h, (x, y) => { nAll++; const i = y * w + x; if (S.skinBig[i] && offPage(i)) skinAll++; });
   if (nCore && skinCore / nCore > T.skinCenter) return fail('skin in the middle');
   if (nAll && skinAll / nAll > T.skinTotal) return fail('too much skin');
 
@@ -459,7 +465,7 @@ function prepare(cv, canvas, keep) {
 // Finds the most document-like four-corner shape in an RGBA canvas, or null if nothing convincing is there.
 // `thorough` adds extra strategies for still photos; the live preview stays strict and fast.
 // `hint` is the page found in the previous live frame (normalised): if it is still there it is confirmed without a new search.
-export function findDocument(cv, canvas, thorough, debug, hint) {
+export function findDocument(cv, canvas, thorough, debug, hint, grow) {
   const mats = [];
   const keep = (m) => (mats.push(m), m);
   try {
@@ -561,7 +567,7 @@ export function findDocument(cv, canvas, thorough, debug, hint) {
       evaluate(jobs, 8);
     }
 
-    if (best) { // pull short corners out to the real page edge; keep the result only if it is still convincing
+    if (best && (thorough || grow)) { // pull short corners out to the real page edge; keep the result only if it is still convincing
       const g = growQuad(S, best.quad);
       const v = judge(cv, S, g, true);
       if (v.ok) best = { quad: g, conf: Math.max(v.conf, best.conf) };
@@ -655,7 +661,7 @@ export function detectCorners(source, { live = false, hint = null } = {}) {
   const sw = source.videoWidth || source.naturalWidth || source.width;
   const sh = source.videoHeight || source.naturalHeight || source.height;
   if (!sw || !sh) return null;
-  const passes = live ? [[320, false]] : [[320, false], [560, true]];
+  const passes = live ? [[256, false]] : [[320, false], [560, true]];
   const c = live ? (scratch ||= document.createElement('canvas')) : document.createElement('canvas');
   try {
     let q = null;
@@ -663,7 +669,7 @@ export function detectCorners(source, { live = false, hint = null } = {}) {
       const s = Math.min(1, side / Math.max(sw, sh));
       c.width = Math.round(sw * s); c.height = Math.round(sh * s);
       c.getContext('2d', { willReadFrequently: true }).drawImage(source, 0, 0, c.width, c.height);
-      q = findDocument(window.cv, c, thorough, false, live ? hint : null);
+      q = findDocument(window.cv, c, thorough, false, live ? hint : null, !live);
       if (q) break;
     }
     if (!q || live) return q;

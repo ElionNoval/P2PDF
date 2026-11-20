@@ -3,7 +3,7 @@ import { MAX_PAGES } from '../lib/image.js';
 import { cvReady, detectCorners } from '../lib/cv.js';
 
 const avgDist = (a, b) => a.reduce((s, p, i) => s + Math.hypot(p.x - b[i].x, p.y - b[i].y), 0) / a.length;
-const LOCK = 6; // consecutive matching frames before a document counts as found
+const LOCK = 3; // consecutive matching frames before a document counts as found
 
 export default function Camera({ count, mode, cv, onCapture, onDone }) {
   const root = useRef(null);
@@ -100,12 +100,12 @@ export default function Camera({ count, mode, cv, onCapture, onDone }) {
         const L = live.current;
         if (q) {
           if (!L.quad) { L.quad = q; L.stable = 1; L.alt = 0; }
-          else if (avgDist(L.quad, q) < 0.07) {
+          else if (avgDist(L.quad, q) < 0.05) {
             L.quad = L.quad.map((p, i) => ({ x: (p.x + q[i].x) / 2, y: (p.y + q[i].y) / 2 }));
             L.stable++; L.alt = 0;
           } else if (++L.alt >= 3) { L.quad = q; L.stable = 1; L.alt = 0; } // a different shape must persist before the outline jumps to it
           L.miss = 0;
-        } else if (++L.miss > 3) { L.quad = null; L.stable = 0; L.alt = 0; }
+        } else if (++L.miss > 4) { L.quad = null; L.stable = 0; L.alt = 0; }
 
         // Map video coordinates to the screen (the preview is object-fit: cover).
         const W = box.clientWidth, H = box.clientHeight;
