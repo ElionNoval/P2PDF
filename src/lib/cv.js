@@ -45,7 +45,7 @@ const T = {
   aspectMax: 2.3,       // longest/shortest side
   sideSupport: 0.6,     // each visible side: share of its length lying on a real, straight, matching edge
   meanSupport: 0.72,    // average over the visible sides
-  minContrast: 7,       // grey-level step across a side
+  minContrast: 7,       // grey-level step across a side (inside brighter than outside)
   paperMinGrey: 70,     // not a dark object (screen off, black cover)
   paperUniform: 0.5,    // share of the interior that is one flat colour (any colour: white, blue, pink...)
   coarseMax: 0.17,      // blankets, folds and pillows vary a lot more than a sheet of paper does
@@ -119,7 +119,7 @@ export function isSkin(r, g, b) {
   const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
   if (mx < 45 || r < g || r < b) return false;
   const s = (mx - mn) / mx;
-  if (s < 0.2 || s > 0.75) return false;
+  if (s < 0.27 || s > 0.75) return false; // shaded white paper under warm light is only ~0.22 saturated
   const hue = (g - b) / (mx - mn); // 0 = red, 0.5 = 30 degrees
   if (hue < -0.09 || hue > 0.53) return false;
   const y = 0.299 * r + 0.587 * g + 0.114 * b;
@@ -218,16 +218,67 @@ function collect(cv, bin, S, retrieval, out, margin) {
   } finally { contours.delete(); hier.delete(); }
 }
 
+// Total length of long lines that do not follow the page sides (folds, creases, pillow edges), in units of the short side.
+function offAxisLength(cv, S, quad) {
+  const { w, h } = S;
+  const centre = shrink(quad, 0.9);
+  const minSide = Math.min(dist(quad[0], quad[1]), dist(quad[1], quad[2]), dist(quad[2], quad[3]), dist(quad[3], quad[0]));
+  const mats = [];
+  const keep = (m) => (mats.push(m), m);
+  let off2 = 0;
+  try {
+    const mask = keep(cv.Mat.zeros(h, w, cv.CV_8UC1));
+    const pts = keep(cv.matFromArray(4, 1, cv.CV_32SC2, centre.flatMap((p) => [Math.round(p.x), Math.round(p.y)])));
+    const mv = keep(new cv.MatVector());
+    mv.push_back(pts);
+    cv.fillPoly(mask, mv, new cv.Scalar(255));
+    const e = keep(new cv.Mat());
+    cv.bitwise_and(S.fineEdges, mask, e);
+    const lines = keep(new cv.Mat());
+    const minLen = Math.round(minSide * 0.3);
+    cv.HoughLinesP(e, lines, 1, Math.PI / 180, Math.max(18, Math.round(minSide * 0.25)), minLen, 4);
+    const dirs = [0, 1, 2, 3].map((i) => Math.atan2(quad[(i + 1) % 4].y - quad[i].y, quad[(i + 1) % 4].x - quad[i].x));
+    const d = lines.data32S;
+    for (let i = 0; i < lines.rows; i++) {
+      const x1 = d[i * 4], y1 = d[i * 4 + 1], x2 = d[i * 4 + 2], y2 = d[i * 4 + 3];
+      const ang = Math.atan2(y2 - y1, x2 - x1);
+      const onAxis = dirs.some((a) => { let df = Math.abs(ang - a) % Math.PI; if (df > Math.PI / 2) df = Math.PI - df; return df < (14 * Math.PI) / 180; });
+      if (!onAxis) off2 += Math.hypot(x2 - x1, y2 - y1);
+    }
+  } finally { mats.forEach((m) => { try { m.delete(); } catch { /* freed */ } }); }
+  return off2 / minSide;
+}
+
 /* ---------- judging a candidate ---------- */
+// Median brightness and main colour of the middle of a candidate.
+function pageTone(S, quad) {
+  const { w, h } = S;
+  const centre = shrink(quad, 0.9);
+  const hist = new Uint32Array(256);
+  let nC = 0;
+  scan(centre, w, h, (x, y) => { hist[S.gray[y * w + x]]++; nC++; });
+  if (nC < 60) return null;
+  let acc = 0, med = 0;
+  while (med < 255 && (acc += hist[med]) < nC / 2) med++;
+  let rr = 0, gg = 0, bb = 0, nr = 0;
+  scan(centre, w, h, (x, y) => { const i = y * w + x; if (Math.abs(S.gray[i] - med) <= 10) { rr += S.rgb[i * 3]; gg += S.rgb[i * 3 + 1]; bb += S.rgb[i * 3 + 2]; nr++; } });
+  if (!nr) return null;
+  return { med, rr: rr / nr, gg: gg / nr, bb: bb / nr, nC, ctol: Math.max(40, med * 0.22) };
+}
+
 // Everything below looks at the candidate the way a person would: are the four sides real, straight, matching edges?
-// Is the inside one flat page rather than a blanket, a table, a face or a hand?
+// Is the inside flat, plain paper rather than a blanket, a table, a face or a hand?
 function judge(cv, S, quad, wantLines) {
   const { w, h } = S;
   const minDim = Math.min(w, h);
   const c = centroid(quad);
   const r = Math.max(2, Math.round(minDim * 0.012)); // search distance across a side
-  const off = Math.max(4, Math.round(minDim * 0.02)); // compare the page just inside with the surface just outside
+  const off = Math.max(4, Math.round(minDim * 0.02)); // compare the paper just inside with the surface just outside
   const fail = (why) => ({ ok: false, why, conf: 0 });
+  const tone = pageTone(S, quad);
+  if (!tone) return fail('too small');
+  // skin-coloured pixels count as a finger only if they differ from the page's own colour (an orange cover is not a hand)
+  const finger = (i) => S.skin[i] && Math.hypot(S.rgb[i * 3] - tone.rr, S.rgb[i * 3 + 1] - tone.gg, S.rgb[i * 3 + 2] - tone.bb) > tone.ctol;
   const sides = [];
 
   for (let i = 0; i < 4; i++) {
@@ -247,7 +298,7 @@ function judge(cv, S, quad, wantLines) {
       const xi = Math.round(px + n.x * off), yi = Math.round(py + n.y * off);
       const xo = Math.round(px - n.x * off), yo = Math.round(py - n.y * off);
       if (xi < 1 || yi < 1 || xi >= w - 1 || yi >= h - 1 || xo < 1 || yo < 1 || xo >= w - 1 || yo >= h - 1) continue;
-      if (S.skin[yi * w + xi] || S.skin[Math.round(py + n.y * 2) * w + Math.round(px + n.x * 2)]) { hid++; continue; } // a finger over the rim
+      if (finger(yi * w + xi) || finger(Math.round(py + n.y * 2) * w + Math.round(px + n.x * 2))) { hid++; continue; } // a finger over the rim
       tot++;
       let best = 0, bs = 0;
       for (let k = -r; k <= r; k++) {
@@ -281,35 +332,36 @@ function judge(cv, S, quad, wantLines) {
   if (sides.filter((s) => s.hidden).length > 1) return fail('too much hidden');
   // every visible side must sit on a real edge; one side may be faint (low contrast against the table) if the others are solid
   const weakSides = vis.filter((s) => s.sup < T.sideSupport);
-  if (weakSides.length > 1 || weakSides.some((s) => s.sup < 0.3) || (weakSides.length === 1 && vis.some((s) => s !== weakSides[0] && s.sup < 0.7)))
+  const solidOthers = (w0) => vis.every((s) => s === w0 || s.sup >= 0.8);
+  if (weakSides.length > 1 || weakSides.some((s) => s.sup < (solidOthers(s) ? 0.12 : 0.3)) || (weakSides.length === 1 && vis.some((s) => s !== weakSides[0] && s.sup < 0.7)))
     return fail('weak side ' + sides.map((s) => s.valid ? s.sup.toFixed(2) : 'x').join('/'));
   const meanSup = vis.reduce((s, v) => s + v.sup, 0) / vis.length;
   if (meanSup < T.meanSupport) return fail('low support');
-  if (vis.some((s) => Math.abs(s.contrast) < T.minContrast && s.cdist < 18)) return fail('no boundary');
-  const lit = vis.filter((s) => Math.abs(s.contrast) >= T.minContrast);
-  if (lit.some((s) => s.contrast > 0) && lit.some((s) => s.contrast < 0)) return fail('mixed edges ' + sides.map((s) => s.contrast.toFixed(0)).join('/'));
+  if (vis.filter((s) => Math.abs(s.contrast) < T.minContrast && s.cdist < 18).length > 1) return fail('no boundary'); // one faint side (a gutter) is fine
   const contrast = vis.reduce((s, v) => s + Math.abs(v.contrast), 0) / vis.length;
   const sharpness = vis.reduce((s, v) => s + v.sharp, 0) / vis.length;
   if (sharpness < T.sharpMin) return fail('soft outline ' + sharpness.toFixed(2));
   if (contrast < T.minContrast * 0.8 && vis.reduce((s, v) => s + v.cdist, 0) / vis.length < 30) return fail('flat contrast');
 
+  // four crisp, straight, matching edges: a printed cover, a laminated card, a photo page. The inside can be anything but mostly skin.
+  if (vis.length === 4 && vis.every((s) => s.sup >= 0.8) && meanSup >= 0.88 && sharpness >= 0.4) {
+    let nK = 0, kS = 0;
+    scan(shrink(quad, 0.7), w, h, (x, y) => { nK++; if (S.skinBig[y * w + x]) kS++; });
+    if (nK < 100) return fail('too small');
+    if (kS / nK > 0.3) return fail('mostly skin');
+    if (wantLines && offAxisLength(cv, S, quad) > 3.5) return fail('creases / folds (framed)');
+    let nU = 0, nIn = 0; // how much of the inside is the page's main colour: the true page outline is flatter than one that swallowed some table
+    scan(shrink(quad, 0.92), w, h, (x, y) => { nU++; const i = y * w + x; if (Math.hypot(S.rgb[i * 3] - tone.rr, S.rgb[i * 3 + 1] - tone.gg, S.rgb[i * 3 + 2] - tone.bb) <= tone.ctol) nIn++; });
+    const uniF = nU ? nIn / nU : 0;
+    return { ok: true, why: 'ok framed', conf: 0.4 + 0.25 * meanSup + 0.1 * clamp01(contrast / 40) + 0.25 * uniF };
+  }
+
   // inside the page: tone, colour, uniformity, coarse variation, skin
   const centre = shrink(quad, 0.9), whole = shrink(quad, 0.97), core = shrink(quad, 0.7);
-  const hist = new Uint32Array(256);
-  let nC = 0;
-  scan(centre, w, h, (x, y) => { hist[S.gray[y * w + x]]++; nC++; });
-  if (nC < 200) return fail('too small');
-  let acc = 0, med = 0;
-  while (med < 255 && (acc += hist[med]) < nC / 2) med++;
+  const { med, rr, gg, bb, nC, ctol } = tone;
   if (med < T.paperMinGrey) return fail('too dark');
-  // the page's main colour = average colour of the pixels around the median brightness
-  let rr = 0, gg = 0, bb = 0, nr = 0;
-  scan(centre, w, h, (x, y) => { const i = y * w + x; if (Math.abs(S.gray[i] - med) <= 10) { rr += S.rgb[i * 3]; gg += S.rgb[i * 3 + 1]; bb += S.rgb[i * 3 + 2]; nr++; } });
-  if (!nr) return fail('no tone');
-  rr /= nr; gg /= nr; bb /= nr;
   const pageSat = (Math.max(rr, gg, bb) - Math.min(rr, gg, bb)) / Math.max(1, Math.max(rr, gg, bb));
   if (pageSat > 0.25 && isSkin(Math.round(rr), Math.round(gg), Math.round(bb))) return fail('page is skin coloured');
-  const ctol = Math.max(40, med * 0.22);
   let near = 0, cs = 0, cq = 0;
   scan(centre, w, h, (x, y) => {
     const i = y * w + x;
@@ -317,7 +369,7 @@ function judge(cv, S, quad, wantLines) {
   });
   const uni = near / nC;
   if (uni < T.paperUniform) return fail('not a flat page ' + uni.toFixed(2));
-  const mean = cs / near, coarseStd = Math.sqrt(Math.max(0, cq / near - mean * mean)) / Math.max(1, mean); // measured on page-coloured pixels only, so print and ink do not count
+  const mean = cs / near, coarseStd = Math.sqrt(Math.max(0, cq / near - mean * mean)) / Math.max(1, mean); // measured on paper pixels only, so print and ink do not count
   if (coarseStd > T.coarseMax) return fail('uneven ' + coarseStd.toFixed(2));
 
   let nCore = 0, skinCore = 0, nAll = 0, skinAll = 0;
@@ -328,88 +380,12 @@ function judge(cv, S, quad, wantLines) {
   if (nAll && skinAll / nAll > T.skinTotal) return fail('too much skin');
 
   // long lines that do not follow the page sides are folds and pillows, not paper
-  let off2 = 0;
-  if (wantLines) {
-    const minSide = Math.min(dist(quad[0], quad[1]), dist(quad[1], quad[2]), dist(quad[2], quad[3]), dist(quad[3], quad[0]));
-    const mats = [];
-    const keep = (m) => (mats.push(m), m);
-    try {
-      const mask = keep(cv.Mat.zeros(h, w, cv.CV_8UC1));
-      const pts = keep(cv.matFromArray(4, 1, cv.CV_32SC2, centre.flatMap((p) => [Math.round(p.x), Math.round(p.y)])));
-      const mv = keep(new cv.MatVector());
-      mv.push_back(pts);
-      cv.fillPoly(mask, mv, new cv.Scalar(255));
-      const e = keep(new cv.Mat());
-      cv.bitwise_and(S.fineEdges, mask, e);
-      const lines = keep(new cv.Mat());
-      const minLen = Math.round(minSide * 0.3);
-      cv.HoughLinesP(e, lines, 1, Math.PI / 180, Math.max(18, Math.round(minSide * 0.25)), minLen, 4);
-      const dirs = [0, 1, 2, 3].map((i) => Math.atan2(quad[(i + 1) % 4].y - quad[i].y, quad[(i + 1) % 4].x - quad[i].x));
-      const d = lines.data32S;
-      for (let i = 0; i < lines.rows; i++) {
-        const x1 = d[i * 4], y1 = d[i * 4 + 1], x2 = d[i * 4 + 2], y2 = d[i * 4 + 3];
-        const ang = Math.atan2(y2 - y1, x2 - x1);
-        const onAxis = dirs.some((a) => { let df = Math.abs(ang - a) % Math.PI; if (df > Math.PI / 2) df = Math.PI - df; return df < (14 * Math.PI) / 180; });
-        if (!onAxis) off2 += Math.hypot(x2 - x1, y2 - y1);
-      }
-      off2 /= minSide;
-    } finally { mats.forEach((m) => { try { m.delete(); } catch { /* freed */ } }); }
-    if (off2 > T.offAxisMax) return fail('creases / folds');
-  }
+  const off2 = wantLines ? offAxisLength(cv, S, quad) : 0;
+  if (off2 > T.offAxisMax) return fail('creases / folds');
 
   const conf = 0.38 * meanSup + 0.2 * clamp01((uni - 0.4) / 0.5) + 0.15 * clamp01(contrast / 40) + 0.15 * (1 - clamp01(coarseStd / 0.2)) + 0.12 * clamp01(1 - off2 / T.offAxisMax);
   if (conf < T.confMin) return fail('low confidence');
   return { ok: true, why: 'ok', conf };
-}
-
-// Share of a side lying on a straight edge that runs along it (same test as in judge, without the extras).
-function edgeSup(S, a, b) {
-  const { w, h } = S;
-  const len = dist(a, b);
-  if (len < 8) return 0;
-  const u = { x: (b.x - a.x) / len, y: (b.y - a.y) / len }, n = { x: -u.y, y: u.x };
-  const r = Math.max(2, Math.round(Math.min(w, h) * 0.012));
-  const steps = Math.max(10, Math.round(len / 2));
-  let tot = 0, hit = 0;
-  for (let j = 0; j <= steps; j++) {
-    const t = 0.04 + (0.92 * j) / steps;
-    const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
-    tot++;
-    for (let k = -r; k <= r; k++) {
-      const x = Math.round(px + n.x * k), y = Math.round(py + n.y * k);
-      if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) continue;
-      const idx = y * w + x, gx = S.gx[idx], gy = S.gy[idx];
-      const gm = Math.hypot(gx, gy);
-      if (gm >= 24 && Math.abs(gx * n.x + gy * n.y) >= 0.85 * gm) { hit++; break; }
-    }
-  }
-  return hit / tot;
-}
-
-// Nudge each corner toward the strongest straight edges without losing a sheet-like shape.
-function growQuad(S, quad) {
-  const { w, h } = S;
-  const minDim = Math.min(w, h);
-  const q = quad.map((p) => ({ ...p }));
-  const score = (z) => z.reduce((t, p, i) => t + edgeSup(S, p, z[(i + 1) % 4]), 0) + (0.4 * polyArea(z)) / (w * h);
-  let cur = score(q);
-  for (const step of [0.035, 0.018, 0.009]) {
-    for (let it = 0; it < 2; it++) {
-      for (let i = 0; i < 4; i++) {
-        let bp = q[i], bs = cur;
-        for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) {
-          if (!dx && !dy) continue;
-          const p = { x: q[i].x + dx * step * minDim, y: q[i].y + dy * step * minDim };
-          const z = q.slice(); z[i] = p;
-          if (!looksLikeSheet(z, w, h, T.marginStill)) continue;
-          const sc = score(z);
-          if (sc > bs + 0.02) { bs = sc; bp = p; }
-        }
-        if (bp !== q[i]) { q[i] = bp; cur = bs; }
-      }
-    }
-  }
-  return q;
 }
 
 // Per-frame data shared by all candidates (copied out of WASM memory so it stays valid).
@@ -430,6 +406,8 @@ function prepare(cv, canvas, keep) {
   cv.GaussianBlur(grayM, coarseM, new cv.Size(k, k), 0);
   const fine = keep(new cv.Mat());
   cv.Canny(blur3, fine, 30, 90);
+  const hEdge = keep(new cv.Mat());
+  cv.Canny(blur3, hEdge, 40, 110);
 
   const rgb = rgbM.data.slice();
   const n = w * h;
@@ -451,15 +429,195 @@ function prepare(cv, canvas, keep) {
   const skinD = keep(new cv.Mat());
   cv.dilate(skinM, skinD, k5);
   const skinDd = skinD.data.slice();
+  // only palm- or face-sized skin blobs count for the 'skin in the middle' test; small orange or red print does not
   const kb = Math.max(5, Math.round(Math.min(w, h) * 0.035) | 1);
   const skinBigM = keep(new cv.Mat());
   cv.morphologyEx(skinM, skinBigM, cv.MORPH_OPEN, keep(cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(kb, kb))));
   const skinBig = skinBigM.data.slice();
   return {
     w, h, rgb, gray: blur3.data.slice(), gx: gxM.data32F.slice(), gy: gyM.data32F.slice(), coarse: coarseM.data.slice(),
-    skin: skinClean, skinBig, skinD, fineEdges: fine, paperM: mk(paper), satM: mk(sat), blur: blur3, rgbM, grayM, k5,
+    skin: skinClean, skinBig, skinD, fineEdges: fine, hEdge, paperM: mk(paper), satM: mk(sat), blur: blur3, rgbM, grayM, k5,
     skinNear: (x, y) => { const xi = Math.round(x), yi = Math.round(y); return xi >= 0 && yi >= 0 && xi < w && yi < h && !!skinDd[yi * w + xi]; },
   };
+}
+
+// Share of a side lying on a straight edge that runs along it (same test as in judge, without the extras).
+function edgeSup(S, a, b, maxSteps, gmin = 24) {
+  const { w, h } = S;
+  const len = dist(a, b);
+  if (len < 8) return 0;
+  const u = { x: (b.x - a.x) / len, y: (b.y - a.y) / len }, n = { x: -u.y, y: u.x };
+  const r = Math.max(2, Math.round(Math.min(w, h) * 0.012));
+  const steps = maxSteps ? Math.min(maxSteps, Math.max(6, Math.round(len / 2))) : Math.max(10, Math.round(len / 2));
+  let tot = 0, hit = 0;
+  for (let j = 0; j <= steps; j++) {
+    const t = 0.04 + (0.92 * j) / steps;
+    const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
+    tot++;
+    for (let k = -r; k <= r; k++) {
+      const x = Math.round(px + n.x * k), y = Math.round(py + n.y * k);
+      if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) continue;
+      const idx = y * w + x, gx = S.gx[idx], gy = S.gy[idx];
+      const gm = Math.hypot(gx, gy);
+      if (gm >= gmin && Math.abs(gx * n.x + gy * n.y) >= 0.85 * gm) { hit++; break; }
+    }
+  }
+  return hit / tot;
+}
+
+// A page whose corner is dark (a green cover corner, a shadow) comes out slightly short. Nudge each corner to where
+// the two adjacent sides sit on the strongest straight edges, in a few shrinking steps, never leaving a sheet-like shape.
+function growQuad(S, quad) {
+  const { w, h } = S;
+  const minDim = Math.min(w, h);
+  const q = quad.map((p) => ({ ...p }));
+  const score = (z) => z.reduce((t, p, i) => t + edgeSup(S, p, z[(i + 1) % 4], 16), 0) + (0.4 * polyArea(z)) / (w * h);
+  let cur = score(q);
+  for (const step of [0.035, 0.018, 0.009]) {
+    for (let it = 0; it < 2; it++) {
+      for (let i = 0; i < 4; i++) {
+        let bp = q[i], bs = cur;
+        for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) {
+          if (!dx && !dy) continue;
+          const p = { x: q[i].x + dx * step * minDim, y: q[i].y + dy * step * minDim };
+          const z = q.slice(); z[i] = p;
+          if (!looksLikeSheet(z, w, h, T.marginStill)) continue;
+          const sc = score(z);
+          if (sc > bs + 0.02) { bs = sc; bp = p; }
+        }
+        if (bp !== q[i]) { q[i] = bp; cur = bs; }
+      }
+    }
+  }
+  return q;
+}
+
+// Candidates from straight lines instead of blobs: works on a busy table, a patterned cloth or a hand, where the page and its
+// surroundings merge into one blob. Long segments are merged into lines, then every plausible "two pairs of parallel lines"
+// rectangle is scored by how much of its outline lies on a real edge.
+function lineCandidates(cv, S, out, margin) {
+  const { w, h } = S;
+  const minDim = Math.min(w, h);
+  const segs = new cv.Mat();
+  try {
+    const minLen = Math.round(minDim * 0.22);
+    cv.HoughLinesP(S.hEdge, segs, 1, Math.PI / 180, Math.max(20, Math.round(minLen * 0.55)), minLen, Math.max(3, Math.round(minDim * 0.03)));
+    const d = segs.data32S;
+    const raw = [];
+    for (let i = 0; i < segs.rows; i++) {
+      const a = { x: d[i * 4], y: d[i * 4 + 1] }, b = { x: d[i * 4 + 2], y: d[i * 4 + 3] };
+      const len = dist(a, b);
+      if (len > 0) raw.push({ a, b, len, u: { x: (b.x - a.x) / len, y: (b.y - a.y) / len } });
+    }
+    // straight stretches of the traced edges (more reliable than Hough on small frames)
+    const cs = new cv.MatVector(), hier = new cv.Mat();
+    try {
+      cv.findContours(S.hEdge, cs, hier, cv.RETR_LIST, cv.CHAIN_APPROX_NONE);
+      const eps = Math.max(2, minDim * 0.012);
+      for (let i = 0; i < cs.size(); i++) {
+        const cnt = cs.get(i);
+        try {
+          if (cnt.rows < minLen) continue;
+          const ap = new cv.Mat();
+          cv.approxPolyDP(cnt, ap, eps, false);
+          const q = ap.data32S;
+          for (let j = 0; j + 1 < ap.rows; j++) {
+            const a = { x: q[j * 2], y: q[j * 2 + 1] }, b = { x: q[j * 2 + 2], y: q[j * 2 + 3] };
+            const len = dist(a, b);
+            if (len >= minLen * 0.8) raw.push({ a, b, len, u: { x: (b.x - a.x) / len, y: (b.y - a.y) / len } });
+          }
+          ap.delete();
+        } finally { cnt.delete(); }
+      }
+    } finally { cs.delete(); hier.delete(); }
+    raw.sort((p, q) => q.len - p.len);
+    const tolD = minDim * 0.025;
+    const cross = (p, q) => p.x * q.y - p.y * q.x;
+    const groups = [];
+    for (const sg of raw.slice(0, 260)) {
+      const g = groups.find((G) =>
+        Math.abs(cross(G.u, sg.u)) < 0.09 &&
+        Math.abs(cross({ x: sg.a.x - G.p.x, y: sg.a.y - G.p.y }, G.u)) < tolD &&
+        Math.abs(cross({ x: sg.b.x - G.p.x, y: sg.b.y - G.p.y }, G.u)) < tolD);
+      if (g) { g.len += sg.len; g.pts.push(sg.a.x, sg.a.y, sg.b.x, sg.b.y); } else groups.push({ p: sg.a, u: sg.u, len: sg.len, pts: [sg.a.x, sg.a.y, sg.b.x, sg.b.y] });
+    }
+    const lines = groups.sort((p, q) => q.len - p.len).slice(0, 26).map((G) => {
+      if (G.pts.length >= 8) {
+        const m = cv.matFromArray(G.pts.length / 2, 1, cv.CV_32FC2, G.pts), l = new cv.Mat();
+        try {
+          cv.fitLine(m, l, cv.DIST_HUBER, 0, 0.01, 0.01);
+          const f = l.data32F;
+          if (Math.abs(f[0] * G.u.x + f[1] * G.u.y) > 0.99) return { p: { x: f[2], y: f[3] }, u: { x: f[0], y: f[1] }, len: G.len };
+        } finally { m.delete(); l.delete(); }
+      }
+      return G;
+    });
+    if (lines.length < 4) return;
+    // pairs of roughly parallel lines that are far enough apart to be two sides of a page
+    const pairs = [];
+    for (let i = 0; i < lines.length; i++) for (let j = i + 1; j < lines.length; j++) {
+      const A = lines[i], B = lines[j];
+      if (Math.abs(cross(A.u, B.u)) > 0.42) continue;
+      if (Math.abs(cross({ x: B.p.x - A.p.x, y: B.p.y - A.p.y }, A.u)) < minDim * 0.2) continue;
+      pairs.push([A, B]);
+    }
+    const hit = (A, B) => {
+      const den = cross(A.u, B.u);
+      if (Math.abs(den) < 0.77) return null; // the two families must be near-perpendicular (perspective allowed)
+      const t = cross({ x: B.p.x - A.p.x, y: B.p.y - A.p.y }, B.u) / den;
+      return { x: A.p.x + A.u.x * t, y: A.p.y + A.u.y * t };
+    };
+    const found = [];
+    for (let i = 0; i < pairs.length; i++) for (let j = i + 1; j < pairs.length; j++) {
+      const [a, b] = pairs[i], [c, dd] = pairs[j];
+      if (a === c || a === dd || b === c || b === dd) continue;
+      const p1 = hit(a, c), p2 = hit(a, dd), p3 = hit(b, dd), p4 = hit(b, c);
+      if (!p1 || !p2 || !p3 || !p4) continue;
+      const q = orderCorners([p1, p2, p3, p4]);
+      const qa = polyArea(q);
+      if (qa < w * h * T.minArea || qa > w * h * T.maxArea || !looksLikeSheet(q, w, h, margin)) continue;
+      let sup = 0, mn = 1;
+      for (let k = 0; k < 4; k++) { const e = edgeSup(S, q[k], q[(k + 1) % 4], 12); sup += e; if (e < mn) mn = e; }
+      sup /= 4;
+      if (mn < 0.4 || sup < 0.65) continue;
+      found.push({ quad: q, pre: 0.7 * sup + 0.3 * Math.sqrt(qa / (w * h)) });
+    }
+    // three solid sides and a faint or hidden fourth (the gutter of an open book, a page running past the frame):
+    // slide the fourth side along and keep the position that sits on the best edge
+    const strong = lines.slice(0, 10);
+    for (const [a, b] of pairs.slice(0, 45)) {
+      for (const c of strong) {
+        if (c === a || c === b) continue;
+        const pa = hit(a, c), pb = hit(b, c);
+        if (!pa || !pb) continue;
+        const cl = dist(pa, pb);
+        if (cl < minDim * 0.25) continue;
+        const ua = a.u, ub = cross(a.u, b.u) !== 0 && a.u.x * b.u.x + a.u.y * b.u.y < 0 ? { x: -b.u.x, y: -b.u.y } : b.u;
+        for (const sg of [1, -1]) {
+          let bq = null, bs = 0, bp = null;
+          for (let f = 0.35; f <= 2.3; f += 0.075) {
+            const pa2 = { x: pa.x + ua.x * sg * f * cl, y: pa.y + ua.y * sg * f * cl };
+            const pb2 = { x: pb.x + ub.x * sg * f * cl, y: pb.y + ub.y * sg * f * cl };
+            const q = orderCorners([pa, pa2, pb2, pb]);
+            const qa = polyArea(q);
+            if (qa < w * h * T.minArea || qa > w * h * T.maxArea || !looksLikeSheet(q, w, h, margin)) continue;
+            const e = edgeSup(S, pa2, pb2, 12, 9); // faint edges count here (a gutter is only a few grey levels)
+            if (e > bs) { bs = e; bq = q; bp = [pa2, pb2]; }
+          }
+          if (!bq || bs < 0.55) continue;
+          // the other three sides must be solid; the sliding one may be faint
+          const e1 = edgeSup(S, pa, bp[0], 12), e2 = edgeSup(S, pb, bp[1], 12), e3 = edgeSup(S, pa, pb, 12);
+          const sup = (e1 + e2 + e3) / 3, mn3 = Math.min(e1, e2, e3);
+          if (sup < 0.7 || mn3 < 0.55) continue;
+          found.push({ quad: bq, pre: 0.7 * sup + 0.3 * Math.sqrt(polyArea(bq) / (w * h)) });
+        }
+      }
+    }
+    found.sort((p, q) => q.pre - p.pre);
+    for (const f of found.slice(0, 10)) out.push(f);
+  } catch (e) {
+    console.warn('Line candidates failed', e);
+  } finally { segs.delete(); }
 }
 
 // Finds the most document-like four-corner shape in an RGBA canvas, or null if nothing convincing is there.
@@ -479,15 +637,16 @@ export function findDocument(cv, canvas, thorough, debug, hint, grow) {
     if (hint) {
       const hq = hint.map((p) => ({ x: p.x * w, y: p.y * h }));
       if (looksLikeSheet(hq, w, h, margin)) {
-        const v = judge(cv, S, hq, true);
+        const v = judge(cv, S, hq, false); // already vetted when it was first found: skip the slow crease check
         if (v.ok) return debug ? { quad: toNorm(hq), conf: v.conf, why: ['hint'] } : toNorm(hq);
       }
     }
 
     const seen = [], verdicts = [];
     let best = null;
+    const pre = [];
     const evaluate = (jobs, limit) => {
-      const cands = [];
+      const cands = pre.splice(0);
       for (const [m, r] of jobs) collect(cv, m, S, r, cands, margin);
       cands.sort((a, b) => b.pre - a.pre);
       let tried = 0;
@@ -505,8 +664,8 @@ export function findDocument(cv, canvas, thorough, debug, hint, grow) {
           }
         }
         verdicts.push(v.why);
-        if (v.ok && (!best || v.conf > best.conf)) best = { quad: q, conf: v.conf };
-        if (best && best.conf > 0.85) break; // clearly a page: stop looking
+        const rank = v.conf + 0.1 * Math.sqrt(polyArea(q) / (w * h)); // among equals, prefer the bigger page
+        if (v.ok && (!best || rank > best.rank)) best = { quad: q, conf: v.conf, rank };
       }
     };
 
@@ -527,7 +686,8 @@ export function findDocument(cv, canvas, thorough, debug, hint, grow) {
     const e1 = keep(new cv.Mat());
     cv.Canny(S.blur, e1, 40, 120);
     cv.dilate(e1, e1, k3);
-    evaluate([[bin, cv.RETR_EXTERNAL], [pm, cv.RETR_EXTERNAL], [e1, cv.RETR_LIST], [sb, cv.RETR_EXTERNAL], [sbi, cv.RETR_EXTERNAL]], thorough ? 6 : 4);
+    lineCandidates(cv, S, pre, margin);
+    evaluate([[bin, cv.RETR_EXTERNAL], [pm, cv.RETR_EXTERNAL], [e1, cv.RETR_LIST], [sb, cv.RETR_EXTERNAL], [sbi, cv.RETR_EXTERNAL]], thorough ? 8 : 6);
 
     // stage 2 (photos only, and only when stage 1 found nothing): the slower strategies
     if (!best && thorough) {
@@ -567,12 +727,11 @@ export function findDocument(cv, canvas, thorough, debug, hint, grow) {
       evaluate(jobs, 8);
     }
 
-    if (best && (thorough || grow)) { // pull short corners out to the real page edge; keep the result only if it is still convincing
+    if (best) { // pull short corners out to the real page edge; keep the result only if it is still convincing
       const g = growQuad(S, best.quad);
       const v = judge(cv, S, g, true);
-      if (v.ok) best = { quad: g, conf: Math.max(v.conf, best.conf) };
+      if (v.ok) best = { quad: g, conf: Math.max(v.conf, best.conf), rank: best.rank };
     }
-
     if (debug) return { quad: best ? toNorm(best.quad) : null, conf: best?.conf, why: verdicts.length ? verdicts : ['no candidates'] };
     return best ? toNorm(best.quad) : null; // nothing convincing: better to show nothing than something wrong
   } finally {
@@ -661,12 +820,13 @@ export function detectCorners(source, { live = false, hint = null } = {}) {
   const sw = source.videoWidth || source.naturalWidth || source.width;
   const sh = source.videoHeight || source.naturalHeight || source.height;
   if (!sw || !sh) return null;
-  const passes = live ? [[256, false]] : [[320, false], [560, true]];
+  // photos: a quick small pass first (usually enough), then the thorough one only if that found nothing
+  const passes = live ? [[70000, false]] : [[70000, false], [250000, true]];
   const c = live ? (scratch ||= document.createElement('canvas')) : document.createElement('canvas');
   try {
     let q = null;
     for (const [side, thorough] of passes) {
-      const s = Math.min(1, side / Math.max(sw, sh));
+      const s = Math.min(1, Math.sqrt(side / (sw * sh)));
       c.width = Math.round(sw * s); c.height = Math.round(sh * s);
       c.getContext('2d', { willReadFrequently: true }).drawImage(source, 0, 0, c.width, c.height);
       q = findDocument(window.cv, c, thorough, false, live ? hint : null, !live);
