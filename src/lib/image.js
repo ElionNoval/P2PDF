@@ -1,5 +1,5 @@
-export const MAX_PAGES = 10;
-export const LIMIT_MSG = 'Only 10 pages are allowed per PDF.';
+export const MAX_PAGES = 50;
+export const LIMIT_MSG = `Page limit reached (${MAX_PAGES} pages per PDF).`;
 const WORK_MAX = 3200; // longest edge kept for each page, keeps memory use sane on phones
 
 export const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -37,7 +37,7 @@ export async function normalize(source) {
     ctx.drawImage(img, 0, 0, w, h);
     const blob = await canvasToBlob(c, 0.93);
     c.width = c.height = 0;
-    return { url: URL.createObjectURL(blob), w, h };
+    return { url: URL.createObjectURL(blob), blob, w, h };
   } finally {
     URL.revokeObjectURL(tmp);
   }

@@ -5,7 +5,7 @@ import { cvReady, detectCorners } from '../lib/cv.js';
 const avgDist = (a, b) => a.reduce((s, p, i) => s + Math.hypot(p.x - b[i].x, p.y - b[i].y), 0) / a.length;
 const LOCK = 3; // consecutive matching frames before a document counts as found
 
-export default function Camera({ count, mode, cv, onCapture, onDone }) {
+export default function Camera({ count, mode, cv, retake, onCapture, onDone }) {
   const root = useRef(null);
   const video = useRef(null);
   const stream = useRef(null);
@@ -133,7 +133,7 @@ export default function Camera({ count, mode, cv, onCapture, onDone }) {
     return () => { stopped = true; clearTimeout(timer); };
   }, [ready, wantLive, cv]);
 
-  const full = count >= MAX_PAGES;
+  const full = retake === null && count >= MAX_PAGES;
   const toggleTorch = async () => {
     try {
       await track.current.applyConstraints({ advanced: [{ torch: !torchOn }] });
@@ -202,7 +202,7 @@ export default function Camera({ count, mode, cv, onCapture, onDone }) {
           </svg>
           {flash && <div className="flash" />}
           <div className="cam-top">
-            <span className="pill">{count} of {MAX_PAGES} pages</span>
+            <span className="pill">{retake === null ? `${count} of ${MAX_PAGES} pages` : `Retaking page ${retake + 1}`}</span>
             {hintText && <span className={`pill ${found ? 'good' : ''}`}>{hintText}</span>}
             {full && <span className="pill warn">Page limit reached</span>}
             {torchOk && <button className="pill pill-btn" onClick={toggleTorch}>Light {torchOn ? 'on' : 'off'}</button>}

@@ -7,6 +7,7 @@ import Export from './screens/Export.jsx';
 import { MAX_PAGES, LIMIT_MSG, normalize, loadImg, isImageFile, tick } from './lib/image.js';
 import { loadOpenCV, detectCorners } from './lib/cv.js';
 import { DEFAULT_EDITS } from './lib/render.js';
+import { saveDraft, loadDraft, clearDraft } from './lib/draft.js';
 
 let uid = 0;
 
@@ -16,8 +17,11 @@ export default function App() {
   const [mode, setMode] = useState('clean'); // original | clean
   const [cv, setCv] = useState('idle'); // idle | loading | ready | failed
   const [editIndex, setEditIndex] = useState(0);
+  const [retake, setRetake] = useState(null);
   const [toast, setToast] = useState('');
   const [installEvt, setInstallEvt] = useState(null);
+  const [draft, setDraft] = useState([]);
+  const [saveOn, setSaveOn] = useState(false);
   const pagesRef = useRef([]);
   const pending = useRef(0);
   const fileInput = useRef(null);
@@ -34,8 +38,44 @@ export default function App() {
     timer.current = setTimeout(() => setToast(''), 4500);
   };
 
-  // Add images from any source. The 10 page limit covers camera + uploads together.
+  useEffect(() => {
+    loadDraft().then((list) => {
+      if (list.length) setDraft(list);
+      else setSaveOn(true);
+    });
+  }, []);
+  useEffect(() => {
+    if (!saveOn) return;
+    const t = setTimeout(() => saveDraft(pages), 700);
+    return () => clearTimeout(t);
+  }, [pages, saveOn]);
+
+  const resumeDraft = () => {
+    if (!draft.length) return;
+    const restored = draft.map((d) => ({ ...d, url: URL.createObjectURL(d.blob) }));
+    uid = Math.max(uid, ...restored.map((p) => p.id || 0));
+    update((p) => {
+      const merged = [...restored, ...p];
+      merged.slice(MAX_PAGES).forEach((page) => URL.revokeObjectURL(page.url));
+      return merged.slice(0, MAX_PAGES);
+    });
+    setDraft([]);
+    setSaveOn(true);
+    return restored.length;
+  };
+  const discardDraft = () => {
+    setDraft([]);
+    setSaveOn(true);
+    clearDraft();
+  };
+  const resumeAndReview = () => {
+    resumeDraft();
+    setScreen('pages');
+  };
+
+  // Add images from any source. The page limit covers camera + uploads together.
   const addImages = async (blobs) => {
+    resumeDraft();
     const room = MAX_PAGES - pagesRef.current.length - pending.current;
     if (room <= 0) { notify(LIMIT_MSG); return 0; }
     let list = blobs;
@@ -79,6 +119,24 @@ export default function App() {
     fileInput.current.click();
   };
 
+  const onCapture = async (blob, hint) => {
+    if (retake === null) return addImages([{ blob, hint }]);
+    const i = retake;
+    const old = pagesRef.current[i];
+    setRetake(null);
+    try {
+      const n = await normalize(blob);
+      const fresh = { id: ++uid, ...n, hint: hint || null, rotate: 0, corners: null, detected: false, skipCrop: false, ...DEFAULT_EDITS };
+      if (old) { fresh.filter = old.filter; fresh.brightness = old.brightness; fresh.contrast = old.contrast; URL.revokeObjectURL(old.url); }
+      update((l) => (old ? l.map((p, j) => (j === i ? fresh : p)) : [...l, fresh]));
+      notify(`Page ${i + 1} replaced.`);
+    } catch {
+      notify('That photo could not be read. Try again.');
+    }
+    setScreen('pages');
+    return 1;
+  };
+
   const patchPage = (id, patch) => update((l) => l.map((p) => (p.id === id ? { ...p, ...patch } : p)));
   const applyToAll = (patch) => update((l) => l.map((p) => ({ ...p, ...patch })));
   const removePage = (i) => {
@@ -96,8 +154,14 @@ export default function App() {
   const newDocument = () => {
     pagesRef.current.forEach((p) => URL.revokeObjectURL(p.url));
     update(() => []);
+    clearDraft();
     setMode('clean');
     setScreen('home');
+  };
+  const scan = () => {
+    resumeDraft();
+    setRetake(null);
+    setScreen('camera');
   };
 
   // Load OpenCV as soon as Clean document mode is active so it is ready before the first scan.
@@ -134,22 +198,27 @@ export default function App() {
   }, []);
   const install = async () => { installEvt.prompt(); await installEvt.userChoice; setInstallEvt(null); };
 
-  const back = () => setScreen(pages.length ? 'pages' : 'home');
+  const back = () => { setRetake(null); setScreen(pages.length ? 'pages' : 'home'); };
 
   return (
     <div className={`app ${screen}`}>
       {screen === 'home' && (
-        <Home onInstall={installEvt ? install : null} count={pages.length} onScan={() => setScreen('camera')} onUpload={pick} onReview={() => setScreen('pages')} />
+        <Home
+          onInstall={installEvt ? install : null} count={pages.length} draftCount={draft.length}
+          onScan={scan} onUpload={pick} onReview={() => setScreen('pages')}
+          onResume={resumeAndReview} onDiscard={discardDraft}
+        />
       )}
       {screen === 'camera' && (
-        <Camera count={pages.length} mode={mode} cv={cv} onCapture={(blob, hint) => addImages([{ blob, hint }])} onDone={back} />
+        <Camera count={pages.length} mode={mode} cv={cv} retake={retake} onCapture={onCapture} onDone={back} />
       )}
       {screen === 'pages' && (
         <Pages
           pages={pages} mode={mode} setMode={setMode} cv={cv} onRetryCv={startCv}
           onMove={movePage} onRemove={removePage}
           onEdit={(i) => { setEditIndex(i); setScreen('edit'); }}
-          onScan={() => setScreen('camera')} onUpload={pick}
+          onRetake={(i) => { setRetake(i); setScreen('camera'); }}
+          onScan={scan} onUpload={pick}
           onExport={() => setScreen('export')} onHome={() => setScreen('home')}
         />
       )}
